@@ -13,16 +13,18 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "kraken:phase0": "tsx src/scripts/ingestKrakenPhase0.ts",
+    "backfill-prices": "tsx src/scripts/backfillPrices.ts",
     "spike-g": "tsx src/scripts/spikeG.ts"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
     "@tao-tools/core": "workspace:*",
-    "@duckdb/node-api": "1.5.5-r.4"
+    "ccxt": "^4.5.75"
   },
   "devDependencies": {
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.4",
+    "@types/node": "^22.0.0",
     "tsx": "^4.19.1",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
   }
 }

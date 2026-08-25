@@ -27,6 +27,7 @@ export async function writeGoldExport(registryPath?: string): Promise<WriteGoldE
   const series: GoldSeries[] = await withDuckDb(async (connection) => {
     const out: GoldSeries[] = [];
     for (const entry of entries) {
+      if (!entry.export) continue; // internal reference series (§8) — materialized, never shipped
       const file = `${goldDir()}/${goldFileForMetric(entry.name)}.parquet`;
       const result = await connection.run(
         `SELECT timestamp_ms, value FROM read_parquet('${escapeSqlLiteral(file)}') ORDER BY timestamp_ms;`,

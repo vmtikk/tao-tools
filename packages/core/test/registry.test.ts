@@ -9,6 +9,7 @@ function entry(overrides: Partial<MetricEntry> & Pick<MetricEntry, "name">): Met
     sql: "SELECT 1",
     depends_on: [],
     changelog: [],
+    export: true,
     ...overrides,
   };
 }

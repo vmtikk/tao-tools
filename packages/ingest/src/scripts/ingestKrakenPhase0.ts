@@ -1,23 +1,30 @@
-import { fetchKrakenOhlc, normalizeKrakenOhlc } from "../exchanges/kraken.js";
+import { fetchCcxtOhlcv, normalizeCcxtOhlcv } from "../exchanges/ccxtOhlcv.js";
 import { writeOhlcBronze } from "../bronze/writer.js";
+import { USD_VENUES } from "../exchanges/venues.js";
 
 /**
  * Phase 0 tracer bullet (tao-analytics-plan.md §6): Kraken TAO/USD, the most
- * recent 24 hours, 1-minute candles, all the way to bronze.
+ * recent 24 hours, 1-minute candles, all the way to bronze. Migrated to
+ * ccxt in Phase 1 along with every other venue (§2 stack) — the venue is
+ * still just Kraken and the window is still just 24h; only the fetch client
+ * changed.
  */
 async function main(): Promise<void> {
-  const sinceSeconds = Math.floor(Date.now() / 1000) - 24 * 60 * 60;
+  const venue = USD_VENUES.find((v) => v.exchange === "kraken");
+  if (!venue) throw new Error('USD_VENUES has no "kraken" entry');
 
-  const response = await fetchKrakenOhlc({ pair: "TAOUSD", intervalMinutes: 1, sinceSeconds });
-  const rows = normalizeKrakenOhlc(response, { pair: "TAOUSD", intervalMinutes: 1 });
+  const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
+
+  const raw = await fetchCcxtOhlcv({ exchangeId: venue.ccxtExchangeId, symbol: venue.ccxtSymbol, sinceMs });
+  const rows = normalizeCcxtOhlcv(raw, { exchange: venue.exchange, pair: venue.pair });
 
   console.log(`Fetched ${rows.length} candles from Kraken TAO/USD.`);
 
   const month = new Date().toISOString().slice(0, 7); // yyyy-mm
   const result = await writeOhlcBronze({
     rows,
-    exchange: "kraken",
-    pair: "TAOUSD",
+    exchange: venue.exchange,
+    pair: venue.pair,
     month,
   });
 

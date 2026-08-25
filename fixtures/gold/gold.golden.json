@@ -2,12 +2,22 @@
   "series": [
     {
       "metric": "price_composite_usd",
-      "version": 1,
+      "version": 2,
       "points": [
         { "timestampMs": 1770000000000, "value": 200 },
         { "timestampMs": 1770000060000, "value": 202 },
         { "timestampMs": 1770000180000, "value": 198 }
       ]
+    },
+    {
+      "metric": "price_composite_btc",
+      "version": 1,
+      "points": []
+    },
+    {
+      "metric": "volume_usd_daily",
+      "version": 1,
+      "points": [{ "timestampMs": 1769990400000, "value": 2300 }]
     }
   ]
 }

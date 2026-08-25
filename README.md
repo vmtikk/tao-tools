@@ -2,9 +2,10 @@
 
 TAO analytics pipeline. See [tao-analytics-plan.md](tao-analytics-plan.md) for the full spec.
 
-**Status: Phase 0 (walking skeleton) implemented, running against a local stand-in for bronze.**
-R2, Blockmachine, and the Vercel deploy hook are not wired up yet — see "Going from local to
-real infra" below.
+**Status: Phase 1 (prices and volume — charts 1–3) implemented, running against a local
+stand-in for bronze.** R2, Blockmachine, and the Vercel deploy hook are not wired up yet — see
+"Going from local to real infra" below. Every venue is fetched through `ccxt` (§2 stack),
+including Kraken — the Phase 0 hand-rolled Kraken REST client was migrated in Phase 1.
 
 ## Setup
 
@@ -16,16 +17,40 @@ cp .env.example .env
 Node 22 is what the plan specifies; this was built and tested on Node 20, which also works —
 upgrade when convenient, nothing here depends on a 22-only feature.
 
-## Running Phase 0 end to end
+## Running the pipeline end to end
 
 ```
-pnpm ingest:kraken          # fetch last 24h Kraken TAO/USD -> data/bronze/prices/kraken/TAOUSD/*.parquet
-pnpm pipeline:materialize   # bronze -> data/silver/ohlcv_1m.parquet -> data/gold/price_composite_1m.parquet
-pnpm pipeline:export        # gold -> data/export/gold.json
-pnpm web:dev                # http://localhost:3000 — renders the chart from data/export/gold.json
+pnpm ingest:kraken               # Phase 0 smoke check: last 24h Kraken TAO/USD -> bronze
+pnpm ingest:backfill-prices      # Phase 1: every venue in packages/ingest/src/exchanges/venues.ts,
+                                  # full history, with gaps logged to data/meta/ingestion_log.parquet
+pnpm pipeline:materialize        # bronze -> silver/ohlcv_1m.parquet -> gold/*.parquet
+pnpm pipeline:export             # gold -> data/export/gold.json
+pnpm pipeline:cross-rate-check   # sanity check: composite USD ÷ BTC/USD should track composite BTC (§4.1)
+pnpm web:dev                     # http://localhost:3000 — renders all three charts from gold.json
 ```
+
+`ingest:backfill-prices` is a real, potentially long-running pull against seven exchanges — it
+has not been run against live APIs yet (only unit/contract-tested against fixtures and injected
+fetchers). Run it manually when ready; it's resumable in the sense that re-running it just
+re-fetches and dedupes in silver, so a partial/interrupted run is not destructive.
 
 `pnpm test` runs the full suite (unit, query, contract, golden-file — see plan §5).
+
+### Venues (Phase 1, §4.1)
+
+| Pair | Venues | Registry metric |
+|---|---|---|
+| TAO/USD, TAO/USDT (folded in as USD-equivalent) | Kraken, Coinbase, Binance, Bybit, OKX, MEXC, Gate | `price_composite_usd` |
+| TAO/BTC | Kraken, Upbit | `price_composite_btc` |
+| BTC/USD (reference only, not a chart) | Kraken | `reference_btc_usd` |
+
+Daily USD volume (`volume_usd_daily`) sums quote volume across the same USD/USDT venues.
+`reference_btc_usd` is registered with `export: false` — it materializes to gold like any other
+metric but never ships in `gold.json`; it only feeds `pipeline:cross-rate-check`.
+
+The live rightmost-pixel edge on the TAO/USD chart (`packages/web/lib/useLiveTicker.ts`) connects
+straight from the browser to Kraken's public ticker websocket — no server, no API key. It hasn't
+been exercised against the live socket in this environment; verify it manually with `pnpm web:dev`.
 
 ## Going from local to real infra
 

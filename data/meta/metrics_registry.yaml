@@ -7,14 +7,12 @@
 # mechanism, not a convention to remember.
 
 - name: price_composite_usd
-  version: 1
+  version: 2
   definition: >
-    Volume-weighted composite TAO/USD close price per 1-minute bucket,
-    across every venue present in silver.ohlcv_1m. A bucket with zero quote
-    volume on every venue is excluded, not weighted as zero. Phase 0 has
-    exactly one venue (Kraken), which makes this the general composite
-    function evaluated at n=1 — Phase 1 widens the venue set and changes no
-    logic here.
+    Volume-weighted composite TAO/USD close price per 1-minute bucket, across
+    every USD- and USDT-quoted venue present in silver.ohlcv_1m (USDT is
+    treated as USD-equivalent per §4.1). A bucket with zero quote volume on
+    every venue is excluded, not weighted as zero.
   params: {}
   depends_on: []
   sql: >
@@ -22,8 +20,71 @@
       timestamp_ms,
       SUM(close * quote_volume) / SUM(quote_volume) AS value
     FROM silver_ohlcv_1m
-    WHERE quote_volume > 0
+    WHERE quote_volume > 0 AND pair IN ('TAOUSD', 'TAOUSDT')
     GROUP BY timestamp_ms
     ORDER BY timestamp_ms
   changelog:
     - v1: initial, Kraken-only (Phase 0)
+    - v2: widened to every USD/USDT venue (Phase 1.1); USDT pairs folded into the USD composite
+
+- name: price_composite_btc
+  version: 1
+  definition: >
+    Volume-weighted composite TAO/BTC close price per 1-minute bucket, across
+    every venue quoting TAO/BTC in silver.ohlcv_1m. Same composite function
+    as price_composite_usd, evaluated over the BTC-quoted pair instead.
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT
+      timestamp_ms,
+      SUM(close * quote_volume) / SUM(quote_volume) AS value
+    FROM silver_ohlcv_1m
+    WHERE quote_volume > 0 AND pair = 'TAOBTC'
+    GROUP BY timestamp_ms
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 1.3)
+
+- name: reference_btc_usd
+  version: 1
+  definition: >
+    Kraken BTC/USD close price per 1-minute bucket. Not a chart — this is the
+    BTC/USD leg the cross-rate sanity check (§4.1) uses to verify
+    price_composite_usd ÷ reference_btc_usd tracks price_composite_btc.
+    Single venue is acceptable for a reference input; it isn't a composite
+    that ships to users.
+  params: {}
+  depends_on: []
+  export: false
+  sql: >
+    SELECT
+      timestamp_ms,
+      SUM(close * quote_volume) / SUM(quote_volume) AS value
+    FROM silver_ohlcv_1m
+    WHERE quote_volume > 0 AND pair = 'BTCUSD'
+    GROUP BY timestamp_ms
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 1.3)
+
+- name: volume_usd_daily
+  version: 1
+  definition: >
+    Total quote volume in USD, summed per UTC day, across every USD- and
+    USDT-quoted venue present in silver.ohlcv_1m. Undercounts versus
+    aggregators — this only sums venues actually polled (§4.1), which is why
+    the chart renders the caveat alongside the series rather than relying on
+    this definition string alone.
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT
+      (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
+      SUM(quote_volume) AS value
+    FROM silver_ohlcv_1m
+    WHERE quote_volume > 0 AND pair IN ('TAOUSD', 'TAOUSDT')
+    GROUP BY 1
+    ORDER BY 1
+  changelog:
+    - v1: initial (Phase 1.4)

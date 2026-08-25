@@ -3,25 +3,33 @@
 import { useMemo, useState } from "react";
 import type { GoldSeriesPoint } from "@tao-tools/core";
 import { niceTicks } from "../lib/niceTicks";
+import { formatBtc, formatTime, formatUsd } from "../lib/format";
 
 const WIDTH = 960;
 const HEIGHT = 360;
 const MARGIN = { top: 16, right: 56, bottom: 28, left: 8 };
 
-function formatUsd(value: number): string {
-  return value.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+export interface LivePoint {
+  timestampMs: number;
+  value: number;
 }
 
-function formatTime(timestampMs: number): string {
-  return new Date(timestampMs).toLocaleString("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+export interface PriceChartProps {
+  points: GoldSeriesPoint[];
+  /** Picks the formatter internally rather than accepting one as a prop —
+   * a function prop can't cross the server/client component boundary
+   * (page.tsx renders this from a Server Component), so the choice has to
+   * stay a serializable string. */
+  unit?: "usd" | "btc";
+  ariaLabel?: string;
+  /** Rightmost-pixel live edge (tao-analytics-plan.md §9, §10) — rendered as
+   * a distinct pulsing marker past the static series, never folded into the
+   * historical line itself. */
+  livePoint?: LivePoint | null;
 }
 
-export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
+export function PriceChart({ points, unit = "usd", ariaLabel = "Price line chart", livePoint = null }: PriceChartProps) {
+  const valueFormatter = unit === "btc" ? formatBtc : formatUsd;
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [showTable, setShowTable] = useState(false);
 
@@ -31,8 +39,12 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
     const plotTop = MARGIN.top;
     const plotBottom = HEIGHT - MARGIN.bottom;
 
-    const xs = points.map((p) => p.timestampMs);
-    const ys = points.map((p) => p.value);
+    const xs: number[] = points.map((p) => Number(p.timestampMs));
+    const ys: number[] = points.map((p) => p.value);
+    if (livePoint) {
+      xs.push(livePoint.timestampMs);
+      ys.push(livePoint.value);
+    }
     const xMin = Math.min(...xs);
     const xMax = Math.max(...xs);
     const yMinRaw = Math.min(...ys);
@@ -43,13 +55,16 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
     const yMin = yTicks[0]!;
     const yMax = yTicks.at(-1)!;
 
-    const xScale = (t: number) => plotLeft + ((t - xMin) / (xMax - xMin || 1)) * (plotRight - plotLeft);
+    // A single point (or a degenerate xMin===xMax range) has no span to
+    // interpolate across — center it instead of collapsing to plotLeft.
+    const xScale = (t: number) =>
+      xMax === xMin ? (plotLeft + plotRight) / 2 : plotLeft + ((t - xMin) / (xMax - xMin)) * (plotRight - plotLeft);
     const yScale = (v: number) => plotBottom - ((v - yMin) / (yMax - yMin || 1)) * (plotBottom - plotTop);
 
     const path = points.map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.timestampMs)} ${yScale(p.value)}`).join(" ");
 
     return { path, xScale, yScale, yTicks, plotLeft, plotRight, plotTop, plotBottom };
-  }, [points]);
+  }, [points, livePoint]);
 
   if (points.length === 0) {
     return <p className="chart-empty">No data yet — run the ingest and pipeline scripts.</p>;
@@ -78,7 +93,7 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
       <svg
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         role="img"
-        aria-label="TAO/USD composite price line chart"
+        aria-label={ariaLabel}
         onMouseMove={handleMove}
         onMouseLeave={() => setHoverIndex(null)}
       >
@@ -92,7 +107,7 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
               className="gridline"
             />
             <text x={plotRight + 8} y={yScale(tick)} dy="0.32em" className="axis-label">
-              {formatUsd(tick)}
+              {valueFormatter(tick)}
             </text>
           </g>
         ))}
@@ -103,8 +118,15 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
 
         <circle cx={xScale(last.timestampMs)} cy={yScale(last.value)} r={4} className="end-marker" />
         <text x={xScale(last.timestampMs) - 8} y={yScale(last.value) - 10} className="end-label" textAnchor="end">
-          {formatUsd(last.value)}
+          {valueFormatter(last.value)}
         </text>
+
+        {livePoint && (
+          <g>
+            <circle cx={xScale(livePoint.timestampMs)} cy={yScale(livePoint.value)} r={9} className="live-marker-pulse" />
+            <circle cx={xScale(livePoint.timestampMs)} cy={yScale(livePoint.value)} r={4} className="live-marker" />
+          </g>
+        )}
 
         {hovered && (
           <g>
@@ -131,7 +153,7 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
           style={{ left: `${(xScale(hovered.timestampMs) / WIDTH) * 100}%` }}
         >
           <div className="tooltip-time">{formatTime(hovered.timestampMs)}</div>
-          <div className="tooltip-value">{formatUsd(hovered.value)}</div>
+          <div className="tooltip-value">{valueFormatter(hovered.value)}</div>
         </div>
       )}
 
@@ -145,14 +167,14 @@ export function PriceChart({ points }: { points: GoldSeriesPoint[] }) {
             <thead>
               <tr>
                 <th>Time</th>
-                <th>TAO/USD</th>
+                <th>Value</th>
               </tr>
             </thead>
             <tbody>
               {points.map((p) => (
                 <tr key={p.timestampMs}>
                   <td>{formatTime(p.timestampMs)}</td>
-                  <td>{formatUsd(p.value)}</td>
+                  <td>{valueFormatter(p.value)}</td>
                 </tr>
               ))}
             </tbody>

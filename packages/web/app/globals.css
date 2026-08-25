@@ -9,6 +9,9 @@
   --baseline: #c3c2b7;
   --series-1: #2a78d6;
   --border-hairline: rgba(11, 11, 11, 0.1);
+  --live-accent: #d6482a;
+  --volume-bar: #7a8ea6;
+  --volume-bar-hover: #2a78d6;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,6 +26,9 @@
     --baseline: #383835;
     --series-1: #3987e5;
     --border-hairline: rgba(255, 255, 255, 0.1);
+    --live-accent: #ef6347;
+    --volume-bar: #4d5f74;
+    --volume-bar-hover: #3987e5;
   }
 }
 
@@ -37,6 +43,9 @@
   --baseline: #383835;
   --series-1: #3987e5;
   --border-hairline: rgba(255, 255, 255, 0.1);
+  --live-accent: #ef6347;
+  --volume-bar: #4d5f74;
+  --volume-bar-hover: #3987e5;
 }
 
 * {
@@ -66,6 +75,22 @@ h1 {
   color: var(--text-secondary);
   font-size: 14px;
   margin: 0 0 24px;
+}
+
+.chart-section {
+  margin-bottom: 40px;
+}
+
+.chart-section h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.section-subtitle {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin: 0 0 12px;
 }
 
 .chart-card {
@@ -205,6 +230,55 @@ th {
 .chart-empty {
   color: var(--text-secondary);
   font-size: 14px;
+}
+
+.live-marker {
+  fill: var(--live-accent);
+  stroke: var(--surface-1);
+  stroke-width: 2;
+}
+
+.live-marker-pulse {
+  fill: var(--live-accent);
+  opacity: 0.35;
+  animation: live-pulse 1.6s ease-out infinite;
+}
+
+@keyframes live-pulse {
+  0% {
+    r: 4;
+    opacity: 0.5;
+  }
+  100% {
+    r: 12;
+    opacity: 0;
+  }
+}
+
+.live-badge {
+  margin: 10px 0 0;
+  color: var(--live-accent);
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--live-accent);
+  display: inline-block;
+}
+
+.volume-bar {
+  fill: var(--volume-bar);
+}
+
+.volume-bar-hovered {
+  fill: var(--volume-bar-hover);
 }
 
 .caveat {

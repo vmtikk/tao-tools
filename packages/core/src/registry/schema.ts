@@ -13,6 +13,10 @@ export const MetricEntrySchema = z.object({
   sql: z.string().min(1),
   depends_on: z.array(z.string()).default([]),
   changelog: z.array(z.record(z.string())).default([]),
+  /** False for internal reference series (e.g. a cross-rate check input) that
+   * materialize to gold like any other metric but never ship in gold.json —
+   * they aren't one of the charts, just plumbing another metric depends on. */
+  export: z.boolean().default(true),
 });
 
 export type MetricEntry = z.infer<typeof MetricEntrySchema>;

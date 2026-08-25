@@ -13,7 +13,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "materialize": "tsx src/scripts/materialize.ts",
-    "export": "tsx src/scripts/exportGold.ts"
+    "export": "tsx src/scripts/exportGold.ts",
+    "cross-rate-check": "tsx src/scripts/crossRateCheck.ts"
   },
   "dependencies": {
     "@tao-tools/core": "workspace:*",

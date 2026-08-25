@@ -4,11 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DuckDBInstance } from "@duckdb/node-api";
 import type { Ohlcv } from "@tao-tools/core";
-
-// packages/ingest/src/bronze/writer.ts -> repo root, regardless of whether
-// this runs from src (tsx) or dist (tsc) and regardless of the invoking
-// process's cwd (pnpm --filter sets cwd to the package directory).
-const REPO_ROOT = join(import.meta.dirname, "..", "..", "..", "..");
+import { resolveBronzeUri as resolveDefaultBronzeUri } from "../paths.js";
 
 /**
  * Bronze is written exclusively by DuckDB COPY (tao-analytics-plan.md §2,
@@ -55,7 +51,7 @@ function toSnakeCaseRow(row: Ohlcv): Record<string, unknown> {
 }
 
 function resolveBronzeUri(explicit: string | undefined): string {
-  const uri = explicit ?? process.env.BRONZE_URI ?? join(REPO_ROOT, "data", "bronze");
+  const uri = explicit ?? resolveDefaultBronzeUri();
   return uri.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
