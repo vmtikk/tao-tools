@@ -1,0 +1,13 @@
+{
+  "series": [
+    {
+      "metric": "price_composite_usd",
+      "version": 1,
+      "points": [
+        { "timestampMs": 1770000000000, "value": 200 },
+        { "timestampMs": 1770000060000, "value": 202 },
+        { "timestampMs": 1770000180000, "value": 198 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,645 @@
+# TAO Analytics — v1 Pipeline
+
+**Status:** Spec / not yet built
+**Scope:** Personal use, single user. No hosting costs, no public API, no redistribution.
+**Goal of v1:** Prove the pipeline works end to end on a small surface area. Subnet/alpha data is
+deliberately excluded — it is the v2 scale-up, and the whole point of v1 is to validate the shape
+before taking that on.
+
+**Method:** TypeScript throughout, built in vertical slices. Every phase ends with a chart rendering
+in a browser from real data that travelled the full bronze → silver → gold → export → web path. No
+phase builds a layer that nothing above it consumes yet.
+
+---
+
+## 1. What v1 delivers
+
+Five charts, all derived from TAO-level data, in the order they light up:
+
+| # | Chart | Lights up | Depends on chain? |
+|---|---|---|---|
+| 1 | **TAO/USD price history** — 1m resolution, to listing date | Phase 0 (thin) → Phase 1 (full) | No |
+| 2 | **TAO/BTC price history** | Phase 1 | No |
+| 3 | **TAO trading volume in USD** — aggregated across venues | Phase 1 | No |
+| 4 | **Wallet count over time** — three definitions, see §7.1 | Phase 3 | Yes |
+| 5 | **Percent of supply in profit** — estimated cost basis, §7.3 | Phase 4 | Yes |
+
+Plus **TAO on exchanges** (§7.2) if the label-building work lands in time — it's independent of
+everything else and can slip without blocking.
+
+Charts 1–3 need no chain access and no paid plan. That is deliberate: three of five charts ship
+before a dollar is spent, and they are the price series that chart 5 later depends on being correct.
+
+**Out of scope for v1:** subnet/alpha analytics, validator yields, APY, emissions breakdowns,
+social/off-chain data, anything requiring per-block resolution.
+
+---
+
+## 2. Architecture
+
+```
+Blockmachine RPC ─┐
+                  ├─→ ingestion workers (local Docker) ─→ BRONZE: Cloudflare R2
+Exchange APIs ────┘                                              │
+                                                                 │ S3 range reads
+                                                                 ↓
+                                              DuckDB (local) ─→ SILVER ─→ GOLD
+                                                                            │
+                                                                            ↓
+                                                          Vercel static site (nightly)
+```
+
+### The layering rule
+
+**Bronze is immutable and never re-fetched.** Every raw API/RPC response is written to Parquet
+before parsing. All derived metrics compute *from bronze*, never by re-hitting the network. When a
+schema decision turns out wrong in month four, that's a local recompute, not another backfill.
+
+Bronze lives on R2 rather than local disk because it's cold — written once, read only on rebuilds.
+Silver and gold are hot (every query touches them) and stay local.
+
+### Stack
+
+- **TypeScript / Node 22** — one language across ingestion, transformation, and the web app. Shared
+  domain types mean the definition of a coldkey balance is the same object in the worker, the
+  registry, and the chart.
+- **pnpm workspaces** — monorepo, see §3.
+- **Docker** — one container for ingestion workers, one local volume for silver/gold
+- **DuckDB** via `@duckdb/node-api` — analytics engine. Reads bronze from R2 in place via the
+  `httpfs` extension; reads silver/gold from local disk. No Postgres, no Timescale, no server process.
+- **Cloudflare R2** — bronze object store. S3-compatible, so DuckDB issues HTTP range requests and
+  fetches only the Parquet column chunks a query needs. Zero egress.
+- **Parquet + zstd** — every layer
+- **`@polkadot/api`** — Substrate JSON-RPC and SCALE decoding, with a custom provider carrying the
+  Blockmachine bearer token
+- **`ccxt`** — exchange REST/websocket, TypeScript-native
+- **Vitest** — unit and DuckDB-backed integration tests
+- **Next.js on Vercel** — static site, §10
+
+### DuckDB is the only Parquet writer
+
+Do not add a JavaScript Parquet library. Every Parquet file in every layer — including bronze — is
+written by DuckDB:
+
+```sql
+COPY (SELECT * FROM staged) TO 's3://tao-bronze/prices/kraken/TAOUSD/2026-08.parquet'
+  (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000);
+```
+
+One writer means one set of type mappings, one compression setting, one row-group policy, and no
+chance of the Node writer and the DuckDB reader disagreeing about how a `bigint` or a timestamp
+round-trips. The Node process stages rows into a DuckDB table and issues `COPY`; it never encodes
+Parquet itself. DuckDB writes to R2 directly through `httpfs`, so there is no local temp file to
+clean up.
+
+### Layout
+
+```
+R2 bucket: tao-bronze/
+  chain/events/{block_range}.parquet          # raw System.Events blobs, unparsed hex
+  chain/metadata/{spec_version}.parquet       # runtime metadata, one row per upgrade
+  prices/{exchange}/{pair}/{yyyy-mm}.parquet  # raw klines
+  chain/checkpoints/{date}.parquet            # monthly reconciliation snapshots
+
+local /data
+  /silver
+    transfers.parquet
+    stake_events.parquet
+    ohlcv_1m.parquet
+    account_balances_daily.parquet
+  /gold
+    price_composite_1m.parquet
+    volume_usd_daily.parquet
+    wallet_counts_daily.parquet
+    exchange_balances_daily.parquet
+    supply_in_profit_daily.parquet
+  /meta
+    metrics_registry.yaml          # see §8
+    exchange_labels.json
+    runtime_versions.parquet
+    ingestion_log.parquet
+  /export
+    gold.json                      # what ships to Vercel
+```
+
+### Sizing expectation
+
+Bronze ~20–50 GB, silver a few GB, gold under 1 MB. If bronze trends well above 50 GB in v1,
+something is being over-captured — investigate before scaling storage.
+
+**Parquet file sizing matters on R2.** Write reasonably large files (roughly 100–500 MB) rather
+than many small objects. Millions of tiny objects burn Class A operations on write and make range
+reads inefficient.
+
+---
+
+## 3. Repo layout and the dependency rule
+
+```
+tao-tools/
+  packages/
+    core/          # pure domain. Types, reducers, composites, validators. ZERO I/O.
+    ingest/        # exchange clients, RPC client, bronze writers
+    pipeline/      # DuckDB sessions, silver/gold materialization, registry runner
+    web/           # Next.js app
+  fixtures/        # recorded API responses, sample blocks, golden gold.json snapshots
+  docker/
+```
+
+**The dependency rule, enforced in CI:** `core` may not import `node:fs`, `node:http`, `ccxt`,
+`@polkadot/api`, `@duckdb/node-api`, or anything that touches a socket or a disk. `ingest` and
+`pipeline` depend on `core`; `core` depends on nothing but itself.
+
+This rule is what makes red-green-refactor possible on a data pipeline. Everything that can be
+*wrong* — the composite weighting, the balance fold, the cost-basis reducer, the dust filter — lives
+in `core` as a pure function over plain data and is testable in milliseconds without a network, a
+database, or a fixture directory. Everything in `ingest` and `pipeline` is plumbing: fetch bytes,
+hand them to `core`, write the result. Plumbing gets contract tests against recorded fixtures; it
+does not get clever.
+
+### Type rules
+
+TypeScript earns its place here by making two specific classes of bug unrepresentable.
+
+**1. Coldkeys are not hotkeys.** §7.1 flags this as critical, and it cannot be enforced by
+convention because both are SS58 addresses with identical form — nothing at runtime distinguishes
+them. So distinguish them at compile time:
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, B> = T & { readonly [brand]: B };
+
+export type Coldkey = Brand<string, 'Coldkey'>;
+export type Hotkey  = Brand<string, 'Hotkey'>;
+```
+
+`Coldkey` and `Hotkey` are mutually unassignable. A function that counts wallets takes
+`Set<Coldkey>` and will not compile if handed hotkeys. Construction goes through
+`asColdkey(s: string)` / `asHotkey(s: string)`, which are the only casts in the codebase and live in
+one audited file.
+
+**There is no `Address` type and no `address` column.** Every schema, every DuckDB column, every
+struct field is named `coldkey` or `hotkey`. A test asserts no silver or gold table exposes a column
+named `address`.
+
+**2. On-chain amounts are `bigint`, never `number`.** TAO is denominated in rao, 1 TAO = 10⁹ rao,
+stored on chain as `u64`. A `u64` in rao exceeds `Number.MAX_SAFE_INTEGER` at ~9.007M TAO — inside
+the range of real exchange balances, not a theoretical edge. Floats also make the cost-basis
+accumulator in §7.3 silently non-reproducible.
+
+```ts
+export type Rao = Brand<bigint, 'Rao'>;   // integer, chain-native
+export type Tao = Brand<number, 'Tao'>;   // decimal, DISPLAY ONLY
+```
+
+Conversion `Rao → Tao` happens at exactly one place: the gold export boundary. DuckDB `BIGINT`
+round-trips to JS `bigint` through `@duckdb/node-api`, so the type survives the whole pipeline. Cost
+basis is accumulated as an integer ratio, not a float.
+
+Also branded: `BlockNumber`, `UnixMillis`, `SpecVersion`, `UsdCents`. Each is a place someone has
+previously passed seconds where milliseconds were expected.
+
+---
+
+## 4. Data sources
+
+### 4.1 Prices and volume — free, no account
+
+Exchange REST kline endpoints, backfilled to listing date, then websocket for live.
+
+| Pair | Venues |
+|---|---|
+| TAO/USD | Kraken, Coinbase |
+| TAO/BTC | Kraken, Upbit |
+| TAO/USDT | Binance, Bybit, OKX, MEXC, Gate |
+
+- Resolution **1m**. Aggregate up locally; never store only aggregates.
+- Store per-venue OHLCV **plus quote volume** — quote volume is what the USD volume chart needs.
+- Build a **volume-weighted composite** for TAO/USD and TAO/BTC. Do not trust a single venue.
+- **Automated sanity check:** composite TAO/USD ÷ BTC/USD should track composite TAO/BTC.
+  Persistent divergence means a venue is stale or mislabeled. This runs as a test, not a dashboard
+  glance — see §6.
+
+`ccxt` normalizes most venue quirks, but not all: pagination direction, max candles per request,
+whether the final candle is partial, and whether volume is base or quote all vary. Each venue gets
+a thin adapter in `ingest` and a contract test against a recorded response (§6).
+
+**Volume caveat to surface in the chart itself:** you only count venues you poll. The series will
+undercount versus aggregators, especially in early history. Label it.
+
+### 4.2 Chain access — Blockmachine
+
+- Endpoints: `https://rpc.blockmachine.io` (HTTP), `wss://rpc.blockmachine.io` (WS)
+- Auth: `Authorization: Bearer <API_KEY>` — passed via the `headers` option on the `@polkadot/api`
+  `HttpProvider` / `WsProvider`
+- **Substrate JSON-RPC, not EVM.** `state_getStorage`, `state_getKeysPaged`, `chain_getBlockHash`,
+  `state_getMetadata`.
+
+Per block, the event capture is two calls: `chain_getBlockHash(n)`, then `state_getStorage` at the
+constant `System.Events` key (`twox128("System") ++ twox128("Events")`). The response is stored as
+raw hex. **No decoding happens during ingestion** — that is what makes bronze re-parseable.
+
+**GATE — Spike G, do this before writing any chain code (§6, Phase 0):**
+
+1. **Verify archive depth reaches TAO genesis (2023).** Blockmachine documents that archive
+   availability and depth vary by network. Test a `state_getStorage` at an early 2023 block hash.
+   If depth is insufficient, the cost-basis metric loses its foundation — stop and raise it.
+2. **Verify metadata version at genesis-era blocks is v14 or later.** v14+ metadata is
+   self-describing, so `@polkadot/api` decodes subtensor's custom events with no hand-written type
+   definitions. If early blocks are pre-v14, decoding those ranges needs bespoke type registries and
+   the effort estimate for Phase 2 changes materially.
+3. **Measure actual RU consumption.** Published RU weights are for EVM methods (`eth_call` = 1,
+   `eth_getLogs` = 5). Substrate method weights are unpublished, and `state_getKeysPaged` may be
+   weighted heavier than a plain storage read. Index ~1,000 blocks on the free tier and read the
+   dashboard. This settles the plan sizing in an hour instead of by estimate.
+
+**Plans:**
+- Backfill: **Pro, $25/mo** — 20M RU, 12,000 req/min. The event index is ~9–18M RU, so Pro's
+  included quota covers it with no overage. On Standard the same pull costs $9 + ~$65 in overage
+  *and* takes ~12.5 days at 1,000 req/min instead of ~25 hours. Pro is both cheaper and faster for
+  this month.
+- Steady state: **Standard, $9/mo** — head-of-chain indexing is ~430k RU/month, 10x headroom.
+
+Build **retry-with-backoff** from the start. Requests over the per-minute limit are rejected
+outright, not queued. Failed requests are not billed.
+
+### 4.3 Bronze storage — Cloudflare R2
+
+- Standard storage $0.015/GB-month; Class A ops (writes, lists) $4.50/million; Class B ops (reads)
+  $0.36/million; egress free at any volume.
+- Free tier: 10 GB storage, 1M Class A, 10M Class B per month.
+- At 50 GB: (50 − 10) × $0.015 = **~$0.60/month**.
+
+**DuckDB reads and writes bronze in place.** Install `httpfs`, `CREATE SECRET` against the R2
+endpoint (`<account>.r2.cloudflarestorage.com`, `region 'auto'`, path-style URLs), query
+`s3://tao-bronze/...` directly. Do not mount R2 as a filesystem (rclone mount, SSHFS, WebDAV) —
+Parquet scans generate many small seeks and filesystem-over-network turns each into a round trip.
+Either native `httpfs` range reads or an explicit local sync. Never the middle.
+
+---
+
+## 5. Testing strategy
+
+Red-green-refactor, applied to a pipeline. The discipline only works if there is something fast and
+deterministic to write a failing test *against*, which is what the §3 dependency rule buys.
+
+### The three test tiers
+
+| Tier | Runs against | Speed | Covers |
+|---|---|---|---|
+| **Unit** | `core`, in-memory, no I/O | <1s whole suite | Every reducer, composite, filter, validator |
+| **Query** | DuckDB in-memory + fixture Parquet | seconds | Every SQL statement in the metric registry |
+| **Contract** | Recorded HTTP/RPC fixtures | seconds | Per-venue adapters, RPC client, retry/backoff |
+
+Live network and real R2 are exercised by **smoke checks**, run on demand and nightly. They are not
+part of `pnpm test` and never gate a commit — a Kraken outage must not turn the suite red.
+
+### Tier 1 — unit, and what belongs in it
+
+Everything that can produce a wrong number:
+
+- **Kline normalization** — per venue, array shape → `Ohlcv`; base vs quote volume; partial final candle
+- **Volume-weighted composite** — including the degenerate cases: one venue, zero volume across all
+  venues, one venue stale (last update > N minutes → excluded, not silently weighted)
+- **Cross-rate divergence check** — given three series, does it flag a planted 5% drift
+- **Event → row normalization** — decoded `EventRecord` → `Transfer` / `StakeEvent`
+- **Balance reconstruction fold** — `(BalanceMap, Event[]) => BalanceMap`. A pure reducer, and the
+  single highest-value test target in the project. Property test it: total supply is conserved
+  across any permutation of transfers.
+- **Cost-basis reducer** — §7.3, parameterized by emission rule, tested under both
+- **Dust filter and coldkey classification** — §7.1
+- **Gap detection** — given a block-height/timestamp sequence with a hole, is the hole reported
+- **Registry DAG** — dependency ordering, cycle detection, unknown-dependency error
+
+### Tier 2 — query tests
+
+Registry SQL is where silent wrongness lives; it is code and it gets tested like code. Each metric
+test spins an in-memory DuckDB, loads a small hand-authored fixture Parquet, runs the registry entry
+verbatim, and asserts the output rows. Fixtures are deliberately tiny (tens of rows) and hand-built
+to contain the edge case — a dust balance exactly at the threshold, a coldkey that goes to zero and
+returns, a day with no events.
+
+### Tier 3 — contract tests
+
+Recorded real responses in `fixtures/`, replayed. Refresh them deliberately, never automatically —
+a fixture that silently re-records defeats the point. Two things they must cover beyond happy path:
+
+- **Rate-limit rejection** — Blockmachine errors immediately rather than queueing. The client's
+  backoff must be tested against a fixture that returns 429, not assumed.
+- **Truncated/partial responses** — the ingestion worker must fail loudly, never write partial bronze.
+
+### Golden files, and how they enforce §8
+
+`gold.json` is snapshot-tested against a committed golden file built from fixture inputs.
+
+This is the enforcement mechanism for the metric registry's versioning rule: **changing a metric
+definition breaks the snapshot.** The only way to make the suite green again is to update the golden
+file, and the code review question at that moment is "did you bump the metric version?" Versioning
+stops being a convention someone remembers and becomes a step you cannot skip.
+
+### The loop, concretely
+
+Taking `wallet_count_dust_filtered` as the example:
+
+1. **Red** — write `dustFilteredCount` test in `core`: a balance map with entries at 0, 0.005, 0.01,
+   and 0.02 TAO plus one hotkey, asserting a count of 1. It fails to compile (function doesn't
+   exist). That counts as red.
+2. **Green** — write the smallest thing that passes. Threshold comparison, hotkey exclusion.
+3. **Red** — add the boundary case: is exactly 0.01 in or out? Decide, document the decision in the
+   registry `definition` string, write the test to match.
+4. **Green** — adjust.
+5. **Refactor** — extract the threshold to the registry entry so it's data, not a literal.
+6. Only now write the registry SQL and its Tier-2 test, then wire it to a chart.
+
+The rule that keeps this honest: **no ingestion work starts before the transformation it feeds is
+tested against fixtures.** Fetching 8.9M blocks to discover the decoder drops stake events is the
+expensive version of a test that costs nothing.
+
+---
+
+## 6. Build phases — vertical slices
+
+Each phase ends with something rendering in a browser. Nothing is built that the layer above it
+doesn't consume in the same phase.
+
+### Phase 0 — Walking skeleton
+
+**The tracer bullet: one venue, one pair, one day, one chart, all the way through.**
+
+Kraken TAO/USD, the most recent 24 hours, 1,440 one-minute candles. That's it. The point is not the
+data; the point is that R2 credentials, DuckDB `httpfs`, the Parquet writer, the silver/gold
+materialization, the registry runner, the JSON export, the Vercel deploy hook, and the chart
+component all work together *before* anything is built at scale.
+
+- `ingest`: Kraken adapter → stage → `COPY` to `s3://tao-bronze/prices/kraken/TAOUSD/{yyyy-mm}.parquet`
+- `pipeline`: bronze → `silver/ohlcv_1m.parquet` → `gold/price_composite_1m.parquet`
+- registry: one entry, `price_composite_usd`, version 1
+- export `gold.json`, deploy, render a line chart
+
+**Composite-of-one is the real composite function called with n=1** — not a passthrough shortcut.
+Phase 1 widens the input array and changes no logic.
+
+Tests written first: Kraken kline normalization (unit), composite with one venue (unit),
+`price_composite_usd` SQL against a 10-row fixture (query), `gold.json` golden file.
+
+**Also in Phase 0, in parallel: Spike G** (§4.2). One to two hours, free tier, no code shipped —
+just answers written into this document. It gates Phase 2, not Phase 0 or 1, so it must not block
+the skeleton. If archive depth fails, charts 4 and 5 are in question and it's better to know in
+week one than month three.
+
+**Done when:** a Vercel URL shows yesterday's TAO/USD from data that went through R2, and
+`pnpm test` is green, and §4.2's three gate questions have written answers.
+
+### Phase 1 — Prices and volume (charts 1, 2, 3)
+
+Widening, no new architecture.
+
+| Slice | Delivers |
+|---|---|
+| 1.1 | Remaining venue adapters, one contract test each. Composite now real. |
+| 1.2 | Full backfill to listing date + gap detection into `ingestion_log.parquet` |
+| 1.3 | TAO/BTC composite + the cross-rate sanity check as a scheduled assertion |
+| 1.4 | USD volume metric and chart, with the undercount caveat rendered in the chart |
+| 1.5 | Live websocket edge — rightmost pixel only (§10) |
+
+**Done when:** charts 1–3 are live on full history and the cross-rate check runs green nightly.
+Zero dollars spent to this point.
+
+### Phase 2 — Chain tracer bullet, then the big pull
+
+| Slice | Delivers |
+|---|---|
+| 2.1 | **1,000 blocks, end to end.** Fetch raw events → bronze → decode at silver → transfers → a transfer-count-per-block chart. Cheap, free tier, proves the decode path. |
+| 2.2 | Balance reconstruction over those 1,000 blocks, reconciled against a `System.Account` read at the range's end block. If reconstructed ≠ actual, the fold is wrong and it is 1,000 blocks of debugging, not 8.9M. |
+| 2.3 | **Full event index backfill.** The one expensive step. Upgrade to Pro, run ~25 hours, resumable and checkpointed. |
+
+2.3 does not start until 2.1 and 2.2 are green *and* Phase 1's composite is validated — §11 explains
+why a wrong price series poisons a year of cost-basis assignments that cannot be cheaply recomputed.
+
+**Done when:** the full event index is in bronze and reconciles against monthly checkpoints.
+
+### Phase 3 — Chain metrics (chart 4, plus exchanges)
+
+| Slice | Delivers |
+|---|---|
+| 3.1 | `account_balances_daily` from the full index; wallet counts, all three series (§7.1); chart 4 |
+| 3.2 | Exchange label set (§7.2) — manual research, can start any time from Phase 1 onward |
+| 3.3 | Exchange balances chart, falls out of 3.1 + 3.2 at zero marginal cost |
+
+### Phase 4 — Supply in profit (chart 5)
+
+| Slice | Delivers |
+|---|---|
+| 4.1 | Cost-basis reducer in `core`, unit tested under both emission rules, decision documented in the registry before any materialization runs |
+| 4.2 | Join to composite price at block timestamp; `supply_in_profit_daily`; chart 5, labeled "estimated cost basis" |
+
+### Phase 5 — Hardening
+
+Nightly orchestration end to end, gap alarms that actually reach you, monthly checkpoint
+reconciliation as a scheduled job, registry version enforcement in CI, **downgrade Blockmachine to
+Standard ($9)**. Only after charts are stable — §11 expects 2–3 schema passes.
+
+---
+
+## 7. Metrics — implementation notes
+
+### 7.1 Wallet count
+
+Derive from the event index, not from daily snapshots. Iterating `System.Account` for hundreds of
+thousands of accounts is thousands of paged requests *per snapshot*; times 1,100 days that is
+hundreds of millions of requests — far more than the event index itself.
+
+Instead: index transfers and stake events once, reconstruct balances locally for every day.
+Snapshots become **monthly reconciliation checkpoints** (~13 of them) to verify reconstructed
+balances haven't drifted, not a daily ingestion job.
+
+Track **three separate series** — conflating them produces a misleading chart:
+
+1. Coldkeys with free balance > 0
+2. Coldkeys with stake > 0
+3. Dust-filtered count (> 0.01 TAO) — strips airdrop and dust noise
+
+**Critical:** distinguish coldkeys from hotkeys. Counting both inflates the number and is wrong.
+Never store a bare `address` column — this is enforced by the branded types and the no-`address`-column
+test in §3, not by remembering.
+
+### 7.2 TAO on exchanges
+
+No vendor sells this. Build the label set manually:
+
+- Seed from Taostats explorer wallet tags (starting point, not a dependency)
+- Cross-reference published exchange proof-of-reserves
+- Confirm by depositing a small amount to a personal exchange deposit address and observing the
+  sweep destination
+
+Store in `/meta/exchange_labels.json` with coldkey, exchange, confidence, date_added, evidence.
+Once ~10–15 coldkeys are labeled, balance history falls out of the event index at zero marginal
+cost.
+
+**Needs periodic re-auditing** — exchanges rotate wallets. Flag labeled coldkeys that go to zero
+and stay there.
+
+### 7.3 Supply in profit — the hard one
+
+Bittensor is account-based, not UTXO. There is no coin-level cost basis. This is an
+**account-level approximation** and must be labeled as such.
+
+**Requires** the full event index from genesis (~8.9M blocks): every `Balances.Transfer`, stake,
+unstake, and emission event. This is the one expensive backfill in v1.
+
+**Method:**
+1. Maintain running weighted-average cost basis per coldkey, accumulated in integer rao — never floats
+2. Mark each inflow at the composite TAO/USD price at that block's timestamp (join from §4.1)
+3. `supply_in_profit` = share of circulating supply held by coldkeys whose basis < spot
+
+**Decide and document the emission rule up front.** Does mined/staking-reward TAO enter at zero
+basis, or at market price on receipt? This materially moves the chart. The reducer takes the rule as
+a parameter and is unit tested under both; the chosen value is written into the metric registry so
+the chart is self-documenting.
+
+**Do not call this MVRV.** It isn't. Label it "estimated cost basis."
+
+---
+
+## 8. Metric registry — build this in Phase 0
+
+With five charts, bespoke SQL per chart is tempting. Don't. The registry is a half-day now and is
+effectively unbuildable retroactively once there are forty charts — which is the stated direction.
+It ships in Phase 0 with one entry, so the pattern exists before there is anything to migrate.
+
+`/meta/metrics_registry.yaml`, one entry per metric, loaded through a Zod schema so a malformed
+entry fails at startup with a line number rather than mid-materialization:
+
+```yaml
+- name: wallet_count_dust_filtered
+  version: 1
+  definition: "Count of coldkeys with balance > 0.01 TAO, excluding hotkeys. Threshold inclusive."
+  params:
+    dust_threshold_rao: 10000000
+  sql: "..."
+  depends_on: [account_balances_daily]
+  changelog:
+    - v1: initial
+```
+
+Gold materialization iterates the registry in dependency order. Shared concepts (circulating supply,
+active coldkeys, composite price) are defined **once** and referenced — otherwise you end up with two
+charts that disagree because they filtered dust differently.
+
+**Every gold row carries the metric version that produced it.** When a chart looks wrong in two
+years, you can answer *why* instead of guessing. The golden-file test in §5 is what stops a
+definition changing without its version.
+
+---
+
+## 9. Deployment
+
+- **Next.js on Vercel Hobby: $0.** 100 GB bandwidth, 1M edge requests, 1M function invocations,
+  4 CPU-hours, 100 build minutes monthly. A personal dashboard won't approach any of it.
+- **Hobby is personal, non-commercial only.** Fine for v1. Monetising means Pro at $20/seat/month.
+- **Nightly job:** rebuild gold → export `gold.json` → push to repo or Vercel Blob → trigger deploy
+  hook.
+- **The site never queries anything at runtime.** No RPC calls, no R2 access, no API keys in the
+  frontend. It reads a static JSON file. This is why it can't break or run up charges.
+- **The live edge is the exception:** current price can come from exchange websockets client-side,
+  since that data is public and free. Everything historical comes from the gold file. Only the
+  rightmost pixel is live.
+- **`gold.json` is typed at both ends.** The export writer and the chart components import the same
+  `GoldExport` type from `core`. A metric whose shape changes breaks the web build, not the chart.
+
+**Scaling escape hatch (do not build in v1):** if gold JSON ever exceeds ~5–10 MB — which happens
+when you move from daily to hourly resolution across many metrics — serve Parquet statically from
+Vercel and query it with DuckDB-WASM in the browser via range requests. Same $0 hosting, scales to
+gigabytes.
+
+---
+
+## 10. Known traps
+
+| Trap | Mitigation |
+|---|---|
+| Silent poller death leaves gaps found months later | Gap detection against block height + timestamp continuity, logged to `ingestion_log.parquet`, checked every run, unit tested against a planted hole |
+| Runtime upgrades change what a storage item *means* | Stamp every row with block number, timestamp, **and runtime version**. Cache metadata per `spec_version` in bronze. Charts spanning upgrades otherwise silently compare incomparable things. |
+| Price errors poison cost basis | Validate §4.1 composite **before** building §7.3 — this is why Phase 1 precedes Phase 4. A year of basis assignments cannot be cheaply recomputed against a corrected price series. |
+| First schema will be wrong | Expect 2–3 passes. Bronze exists so passes 2–3 are local recompute. Stay on Pro until charts are stable. |
+| Filtered event capture blocks v2 | **Store the entire `System.Events` blob per block, unparsed hex.** You're already paying the RU for the block; capturing all events costs nothing extra in requests and ~3–5× disk. Decode selectively at silver. If bronze only holds transfers, adding subnet metrics in v2 means another full backfill. |
+| Many small R2 objects | Write 100–500 MB Parquet files. Millions of tiny objects burn Class A ops and defeat range reads. |
+| Rate limit rejections | Exponential backoff; over-limit requests error immediately rather than queueing. Contract tested against a 429 fixture. |
+| `number` silently truncating rao | Branded `Rao = bigint` (§3). u64 rao exceeds `MAX_SAFE_INTEGER` at ~9.007M TAO — a reachable balance, not a theoretical one. |
+| Coldkey/hotkey conflation | Branded types, no `address` column, asserted by test (§3, §7.1) |
+| Tests that hit the network | Only smoke checks touch live APIs, and they never gate a commit. A venue outage must not turn the suite red. |
+| Metric definition drifts without a version bump | Golden-file snapshot of `gold.json` (§5) — the definition cannot change without the snapshot failing |
+
+---
+
+## 11. Costs
+
+**Backfill, months 1–3**
+
+| Item | Cost |
+|---|---|
+| Blockmachine Pro | $25/mo |
+| Cloudflare R2 (bronze) | ~$0.60/mo |
+| Exchange APIs, Vercel, local compute | $0 |
+| **Total** | **~$77 for three months** |
+
+Phases 0 and 1 run entirely on free tiers. The Pro plan is only needed from Phase 2.3.
+
+**Steady state**
+
+| Item | Cost |
+|---|---|
+| Blockmachine Standard | $9/mo |
+| Cloudflare R2 | ~$0.60/mo |
+| Everything else | $0 |
+| **Total** | **~$10/month** |
+
+---
+
+## 12. Rejected options — do not re-litigate
+
+- **Python for ingestion** — `substrate-interface` and the `bittensor` SDK are more mature than
+  `@polkadot/api` for chain work, but the site is TypeScript regardless, and a split-language repo
+  means duplicated domain types, two test runners, two dependency stories, and a serialization
+  boundary between the pipeline and the chart it feeds. One language keeps `GoldExport` a single
+  definition. `@polkadot/api` covers everything v1 needs: raw storage reads and metadata-driven
+  SCALE decoding.
+- **A JavaScript Parquet library** — DuckDB writes every Parquet file (§2). Two writers means two
+  type-mapping behaviours and eventual disagreement about round-tripping.
+- **Floats for on-chain amounts** — see §3 and §10.
+- **Taostats API ($49–199/mo)** — sells derived analytics we compute ourselves; licensed data with
+  redistribution restrictions. Free tier is useful as a cross-check on our own numbers, nothing more.
+- **CoinGecko paid tiers ($35–129/mo)** — unnecessary for personal use. Exchange APIs give the same
+  data free. Free Demo tier is fine for one-off calibration of the volume composite.
+- **Self-hosted subtensor archive node** — 4–6 TB NVMe and rising, days-to-weeks initial sync,
+  24/7 uptime requirement on a machine that sleeps. ~30+ months to break even against $9/mo, and
+  it does not remove any indexing work: the chain does not store aggregates either way. Only flips
+  if per-block resolution across all history becomes necessary, which nothing in v1 requires.
+- **Postgres / TimescaleDB** — DuckDB over Parquet is faster for single-user analytical scans and
+  needs no server process.
+- **Hippius (SN75) or other decentralized storage as primary** — S3-compatible, but ~18 months old
+  and data availability depends on subnet miner incentives. Bronze is the one irreplaceable asset;
+  the price gap versus R2 is under $3/month, which doesn't buy meaningful risk. Also correlated:
+  storing a Bittensor archive on Bittensor. Reasonable as a *second* copy later.
+- **Hetzner Storage Box** — cheaper flat rate (€3.20/TB) and the right answer above ~230 GB, but no
+  S3 API, so no in-place querying. Revisit in v2 if subnet capture pushes bronze into the hundreds
+  of GB.
+- **Remote storage mounted as a filesystem** — see §4.3. Never.
+- **Building all of bronze before building any chart** — the original build order. It defers the
+  first end-to-end validation past the one irreversible spend. Phase 0 exists to invert that.
+
+---
+
+## 13. v2 — explicitly deferred
+
+Not now, but design v1 so these don't require a re-backfill:
+
+- Subnet/alpha token metrics (bronze grows to ~200–500 GB; likely triggers the move to a Storage
+  Box and a bigger local disk)
+- Monthly checkpointing of derived state, so full rebuilds start from the nearest checkpoint rather
+  than genesis — build this the first time a rebuild becomes annoying, not before
+- DuckDB-WASM browser querying if gold outgrows static JSON
+- Validator yields, APY, emissions breakdowns
+
+The one v1 decision that protects all of this: **capture full `System.Events`, not a filtered
+subset** (§10).

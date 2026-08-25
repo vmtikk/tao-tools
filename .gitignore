@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+
+# Local stand-in for R2 bronze, plus silver/gold/export outputs.
+# metrics_registry.yaml and exchange_labels.json are source config and stay tracked.
+data/bronze/
+data/silver/
+data/gold/
+data/export/
+data/meta/*.parquet
+
+.env
+.env.local
+
+# DuckDB scratch files
+*.duckdb
+*.duckdb.wal

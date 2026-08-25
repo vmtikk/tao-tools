@@ -1,0 +1,29 @@
+# Metric registry (tao-analytics-plan.md §8). One entry per gold metric,
+# loaded through the Zod schema in packages/core/src/registry/schema.ts so a
+# malformed entry fails at startup with a line number, not mid-materialization.
+#
+# Changing `sql` or `params` without bumping `version` will fail the golden
+# gold.json snapshot test in packages/pipeline/test — that's the enforcement
+# mechanism, not a convention to remember.
+
+- name: price_composite_usd
+  version: 1
+  definition: >
+    Volume-weighted composite TAO/USD close price per 1-minute bucket,
+    across every venue present in silver.ohlcv_1m. A bucket with zero quote
+    volume on every venue is excluded, not weighted as zero. Phase 0 has
+    exactly one venue (Kraken), which makes this the general composite
+    function evaluated at n=1 — Phase 1 widens the venue set and changes no
+    logic here.
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT
+      timestamp_ms,
+      SUM(close * quote_volume) / SUM(quote_volume) AS value
+    FROM silver_ohlcv_1m
+    WHERE quote_volume > 0
+    GROUP BY timestamp_ms
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial, Kraken-only (Phase 0)
