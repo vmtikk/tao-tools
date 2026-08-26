@@ -88,3 +88,24 @@
     ORDER BY 1
   changelog:
     - v1: initial (Phase 1.4)
+
+- name: transfer_count_per_block
+  version: 1
+  definition: >
+    Count of Balances.Transfer events per block, over whatever block range is
+    currently in silver.transfers (Phase 2.1 tracer bullet: blocks 1-1000 from
+    genesis). x-axis is each block's on-chain timestamp (Timestamp.Now,
+    captured alongside System.Events in bronze — §10), not wall-clock
+    ingestion time. Requires chain bronze; absent in a Phase 1-only
+    environment (see materializeGold's guard on silver_transfers).
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT
+      timestamp_ms,
+      COUNT(*) AS value
+    FROM silver_transfers
+    GROUP BY timestamp_ms
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 2.1)

@@ -38,3 +38,7 @@ export function formatTime(timestampMs: number): string {
 export function formatDay(timestampMs: number): string {
   return new Date(timestampMs).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
+
+export function formatCount(value: number): string {
+  return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}

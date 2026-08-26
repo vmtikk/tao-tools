@@ -253,6 +253,21 @@ raw hex. **No decoding happens during ingestion** — that is what makes bronze 
    weighted heavier than a plain storage read. Index ~1,000 blocks on the free tier and read the
    dashboard. This settles the plan sizing in an hour instead of by estimate.
 
+**Findings (run 2026-08-26, free tier, `pnpm spike-g` plus ad hoc probing against
+`https://rpc.blockmachine.io`):**
+1. **PASS.** `chain_getBlockHash(1)` and `state_getStorage` at that hash both succeed — archive
+   reaches genesis (block 1, 2023-03-20).
+2. **PASS.** Metadata at block 1 is V14 (self-describing).
+3. **Measured, but in a different unit than the Standard/Pro RU quotas above.** The free tier
+   throttles by `cu_per_minute`, not a monthly RU budget: 50 compute-units/minute, and
+   `chain_getBlockHash` / `state_getStorage` / `state_getMetadata` / `state_getRuntimeVersion` each
+   cost 1 CU (measured empirically — the API doesn't publish per-method weights, and a 429 response
+   carries `{limit, remaining, reset, retry_after_ms}` so a client can pace itself exactly rather
+   than guess). This says nothing directly about Pro/Standard's RU-per-request pricing for the full
+   backfill (2.3) — that still needs its own measurement once Pro is active — but it fully sized
+   Phase 2.1/2.2: 1,000 blocks x 3 calls/block (hash + events + timestamp) = ~3,000 CU, paced to
+   ~40/min to stay under the cap, ran in **~75 minutes** end to end with zero cost.
+
 **Plans:**
 - Backfill: **Pro, $25/mo** — 20M RU, 12,000 req/min. The event index is ~9–18M RU, so Pro's
   included quota covers it with no overage. On Standard the same pull costs $9 + ~$65 in overage
@@ -567,6 +582,7 @@ gigabytes.
 | Rate limit rejections | Exponential backoff; over-limit requests error immediately rather than queueing. Contract tested against a 429 fixture. |
 | `number` silently truncating rao | Branded `Rao = bigint` (§3). u64 rao exceeds `MAX_SAFE_INTEGER` at ~9.007M TAO — a reachable balance, not a theoretical one. |
 | Coldkey/hotkey conflation | Branded types, no `address` column, asserted by test (§3, §7.1) |
+| Genesis-funded accounts have no funding event | Confirmed on mainnet during Phase 2.2 (blocks 1–1000): several coldkeys held tens of thousands of TAO **at block 0**, before any block executed — genesis state is constructed directly, not via an extrinsic, so `Balances.Deposit` never fires for it. A balance fold seeded from an empty map can never reconcile these; it isn't a fold bug, it's a baseline bug. Fix: seed the fold from a real `System.Account` snapshot at `fromBlock - 1`, not an assumed zero (see `reconcileBalances.ts`). **This is a third category §7.3's emission-rule decision doesn't cover** ("mined/staking-reward TAO enter at zero basis, or at market price on receipt?") — genesis TAO has no receipt block at all. Phase 4 needs an explicit rule for it (likely: cost basis = price at genesis timestamp, or documented as zero-basis by convention) before the cost-basis reducer touches these coldkeys. |
 | Tests that hit the network | Only smoke checks touch live APIs, and they never gate a commit. A venue outage must not turn the suite red. |
 | Metric definition drifts without a version bump | Golden-file snapshot of `gold.json` (§5) — the definition cannot change without the snapshot failing |
 

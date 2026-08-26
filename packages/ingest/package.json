@@ -14,10 +14,13 @@
     "test": "vitest run",
     "kraken:phase0": "tsx src/scripts/ingestKrakenPhase0.ts",
     "backfill-prices": "tsx src/scripts/backfillPrices.ts",
-    "spike-g": "tsx src/scripts/spikeG.ts"
+    "spike-g": "tsx src/scripts/spikeG.ts",
+    "chain:ingest": "tsx src/scripts/ingestChainRange.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",
+    "@polkadot/util": "^14.0.3",
+    "@polkadot/util-crypto": "^14.0.3",
     "@tao-tools/core": "workspace:*",
     "ccxt": "^4.5.75"
   },

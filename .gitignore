@@ -17,3 +17,6 @@ data/meta/*.parquet
 # DuckDB scratch files
 *.duckdb
 *.duckdb.wal
+
+# Ad hoc script output (e.g. nohup'd long-running ingest runs)
+*.log

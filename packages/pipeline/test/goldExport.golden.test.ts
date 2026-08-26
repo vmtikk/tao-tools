@@ -37,6 +37,35 @@ describe("gold.json golden file", () => {
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
+  /**
+   * Writes silver/transfers.parquet directly, skipping bronze and the SCALE
+   * decode step (that path is covered by decodeEvents' own tests) — this
+   * test is about registry/materialize wiring, and `transfer_count_per_block`
+   * is now part of the real registry every `materializeGold(REGISTRY_PATH)`
+   * call here exercises, so it needs *some* silver_transfers input to not
+   * fail on a missing view.
+   */
+  function writeFixtureTransfersSilver(): Promise<void> {
+    const silverDir = join(tempRoot, "data", "silver");
+    mkdirSync(silverDir, { recursive: true });
+    const file = join(silverDir, "transfers.parquet").replace(/\\/g, "/");
+    return withDuckDb(async (connection) => {
+      await connection.run(`
+        CREATE TABLE transfers (
+          block_number BIGINT, event_index INTEGER, timestamp_ms BIGINT,
+          from_coldkey VARCHAR, to_coldkey VARCHAR, amount_rao BIGINT
+        );
+      `);
+      await connection.run(`
+        INSERT INTO transfers VALUES
+          (1, 0, 1770000000000, '5Alice', '5Bob',   1000000000),
+          (1, 1, 1770000000000, '5Bob',   '5Carol',  500000000),
+          (2, 0, 1770000060000, '5Carol', '5Alice',  200000000);
+      `);
+      await connection.run(`COPY transfers TO '${file}' (FORMAT PARQUET, COMPRESSION ZSTD);`);
+    });
+  }
+
   it("matches the committed golden file for a small fixture bronze input", async () => {
     const bronzeDir = join(tempRoot, "data", "bronze", "prices", "kraken", "TAOUSD");
     mkdirSync(bronzeDir, { recursive: true });
@@ -61,6 +90,7 @@ describe("gold.json golden file", () => {
     });
 
     await materializeSilverOhlcv();
+    await writeFixtureTransfersSilver();
     await materializeGold(REGISTRY_PATH);
     const { destination } = await writeGoldExport(REGISTRY_PATH);
 
@@ -91,6 +121,7 @@ describe("gold.json golden file", () => {
     });
 
     await materializeSilverOhlcv();
+    await writeFixtureTransfersSilver();
     const goldResults = await materializeGold(REGISTRY_PATH);
 
     const silverPath = join(tempRoot, "data", "silver", "ohlcv_1m.parquet").replace(/\\/g, "/");

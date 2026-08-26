@@ -14,11 +14,16 @@
     "test": "vitest run",
     "materialize": "tsx src/scripts/materialize.ts",
     "export": "tsx src/scripts/exportGold.ts",
-    "cross-rate-check": "tsx src/scripts/crossRateCheck.ts"
+    "cross-rate-check": "tsx src/scripts/crossRateCheck.ts",
+    "chain:materialize-silver": "tsx src/scripts/materializeChainSilver.ts",
+    "chain:reconcile-balances": "tsx src/scripts/reconcileBalances.ts"
   },
   "dependencies": {
     "@tao-tools/core": "workspace:*",
+    "@tao-tools/ingest": "workspace:*",
     "@duckdb/node-api": "1.5.5-r.4",
+    "@polkadot/types": "^16.5.6",
+    "@polkadot/util": "^14.0.3",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

@@ -2,12 +2,14 @@ import { loadGoldExport } from "../lib/loadGoldExport";
 import { LiveUsdPriceChart } from "../components/LiveUsdPriceChart";
 import { PriceChart } from "../components/PriceChart";
 import { VolumeChart } from "../components/VolumeChart";
+import { TransferCountChart } from "../components/TransferCountChart";
 
 export default function HomePage() {
   const gold = loadGoldExport();
   const usdSeries = gold.series.find((s) => s.metric === "price_composite_usd");
   const btcSeries = gold.series.find((s) => s.metric === "price_composite_btc");
   const volumeSeries = gold.series.find((s) => s.metric === "volume_usd_daily");
+  const transferCountSeries = gold.series.find((s) => s.metric === "transfer_count_per_block");
 
   return (
     <main>
@@ -53,6 +55,21 @@ export default function HomePage() {
           <p className="caveat">
             Sums only the venues this pipeline polls — undercounts vs. aggregators that see every
             venue (tao-analytics-plan.md §4.1).
+          </p>
+        </div>
+      </section>
+
+      <section className="chart-section">
+        <h2>Transfer count per block</h2>
+        <p className="section-subtitle">
+          Phase 2.1 tracer bullet: blocks 1-1000 from genesis, decoded from raw chain events.
+          {transferCountSeries ? ` Metric v${transferCountSeries.version}.` : ""}
+        </p>
+        <div className="chart-card">
+          <TransferCountChart points={transferCountSeries?.points ?? []} />
+          <p className="caveat">
+            Proves the chain decode path end to end (bronze -&gt; silver -&gt; gold), not a
+            representative activity chart — this window is the chain&apos;s first ~3 hours.
           </p>
         </div>
       </section>

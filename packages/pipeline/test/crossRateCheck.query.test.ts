@@ -71,6 +71,23 @@ describe("runCrossRateCheck (integration)", () => {
     );
 
     await materializeSilverOhlcv();
+    // materializeGold now runs every registry entry, including
+    // transfer_count_per_block — this test only exercises the price/BTC
+    // path, so an empty-but-correctly-shaped transfers.parquet is enough to
+    // not fail on a missing silver_transfers view.
+    await withDuckDb(async (connection) => {
+      const silverDir = join(tempRoot, "data", "silver");
+      mkdirSync(silverDir, { recursive: true });
+      await connection.run(`
+        CREATE TABLE transfers (
+          block_number BIGINT, event_index INTEGER, timestamp_ms BIGINT,
+          from_coldkey VARCHAR, to_coldkey VARCHAR, amount_rao BIGINT
+        );
+      `);
+      await connection.run(
+        `COPY transfers TO '${join(silverDir, "transfers.parquet").replace(/\\/g, "/")}' (FORMAT PARQUET, COMPRESSION ZSTD);`,
+      );
+    });
     await materializeGold(REGISTRY_PATH);
 
     const { divergences } = await runCrossRateCheck();
