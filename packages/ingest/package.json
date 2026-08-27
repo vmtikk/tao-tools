@@ -15,7 +15,8 @@
     "kraken:phase0": "tsx src/scripts/ingestKrakenPhase0.ts",
     "backfill-prices": "tsx src/scripts/backfillPrices.ts",
     "spike-g": "tsx src/scripts/spikeG.ts",
-    "chain:ingest": "tsx src/scripts/ingestChainRange.ts"
+    "chain:ingest": "tsx src/scripts/ingestChainRange.ts",
+    "chain:backfill": "tsx src/scripts/backfillChainEvents.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",

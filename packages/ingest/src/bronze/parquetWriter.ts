@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -31,6 +31,43 @@ export interface WriteRowsAsParquetResult {
   rowCount: number;
 }
 
+/**
+ * Writes rows to `path` as newline-delimited JSON, one `stream.write()` per
+ * row rather than building the whole NDJSON payload as a single JS string
+ * first. That in-memory-string approach (`rows.map(...).join("\n")`) is what
+ * this replaced — it hit `RangeError: Invalid string length` on a real
+ * 20,001-block chain-events bronze write (2026-08-26, tao-analytics-plan.md
+ * §6, Phase 2.3 sample): `events_hex` blobs vary a lot in size across
+ * blocks, and this particular real range's combined NDJSON exceeded V8's
+ * ~512MB-1GB single-string ceiling well before hitting any row-count limit
+ * that would look dangerous in a smaller test. Streaming avoids the ceiling
+ * entirely — no step here ever holds more than one row's JSON plus whatever
+ * is still in the OS write buffer.
+ */
+function writeNdjsonStreaming(path: string, rows: readonly Record<string, unknown>[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stream = createWriteStream(path, { encoding: "utf-8" });
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+
+    let index = 0;
+    const writeNext = (): void => {
+      let canWriteMore = true;
+      while (index < rows.length && canWriteMore) {
+        const line = JSON.stringify(rows[index], (_key, value) => (typeof value === "bigint" ? value.toString() : value));
+        canWriteMore = stream.write(index === rows.length - 1 ? line : `${line}\n`);
+        index++;
+      }
+      if (index < rows.length) {
+        stream.once("drain", writeNext);
+      } else {
+        stream.end();
+      }
+    };
+    writeNext();
+  });
+}
+
 export async function writeRowsAsParquet(opts: WriteRowsAsParquetOptions): Promise<WriteRowsAsParquetResult> {
   const destination = opts.destination.replace(/\\/g, "/");
   const isRemote = destination.startsWith("s3://");
@@ -40,28 +77,33 @@ export async function writeRowsAsParquet(opts: WriteRowsAsParquetOptions): Promi
   }
 
   const stagingFile = join(tmpdir(), `tao-bronze-stage-${randomUUID()}.ndjson`);
-  const ndjson = opts.rows
-    .map((row) => JSON.stringify(row, (_key, value) => (typeof value === "bigint" ? value.toString() : value)))
-    .join("\n");
-  writeFileSync(stagingFile, ndjson, "utf-8");
-
-  const instance = await DuckDBInstance.create(":memory:");
-  const connection = await instance.connect();
   try {
-    if (isRemote) {
-      await configureR2Secret(connection);
-    }
+    await writeNdjsonStreaming(stagingFile, opts.rows);
 
-    await connection.run(
-      `CREATE OR REPLACE TABLE staged AS SELECT * FROM read_json_auto('${escapeSqlLiteral(stagingFile)}');`,
-    );
-    await connection.run(
-      `COPY (SELECT * FROM staged) TO '${escapeSqlLiteral(destination)}' ` +
-        `(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000);`,
-    );
+    const instance = await DuckDBInstance.create(":memory:");
+    const connection = await instance.connect();
+    try {
+      if (isRemote) {
+        await configureR2Secret(connection);
+      }
+
+      await connection.run(
+        `CREATE OR REPLACE TABLE staged AS SELECT * FROM read_json_auto('${escapeSqlLiteral(stagingFile)}');`,
+      );
+      await connection.run(
+        `COPY (SELECT * FROM staged) TO '${escapeSqlLiteral(destination)}' ` +
+          `(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000);`,
+      );
+    } finally {
+      connection.closeSync();
+      instance.closeSync();
+    }
   } finally {
-    connection.closeSync();
-    instance.closeSync();
+    // Covers a failure in the streaming write itself (e.g. the real ENOSPC
+    // hit during a 2026-08-26 Phase 2.3 sample, plan §6) as well as the
+    // DuckDB step — previously this cleanup only wrapped the DuckDB half, so
+    // a write failure left a partial (sometimes very large) staging file
+    // behind permanently.
     rmSync(stagingFile, { force: true });
   }
 

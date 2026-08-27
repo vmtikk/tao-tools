@@ -26,9 +26,10 @@ async function main(): Promise<void> {
   const fromBlock = Number(process.env.FROM_BLOCK ?? 1);
   const toBlock = Number(process.env.TO_BLOCK ?? 1000);
   const maxRequestsPerMinute = Number(process.env.CHAIN_MAX_RPM ?? 40);
+  const concurrency = Number(process.env.CHAIN_CONCURRENCY ?? 1);
 
   console.log(`Chain ingest: blocks ${fromBlock}-${toBlock} (${toBlock - fromBlock + 1} blocks), ` +
-    `paced to ${maxRequestsPerMinute} req/min.`);
+    `paced to ${maxRequestsPerMinute} req/min, concurrency ${concurrency}.`);
 
   const client = createBlockmachineClient({
     apiKey,
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
     client,
     fromBlock,
     toBlock,
+    concurrency,
     onProgress: (done, total) => {
       if (done % 50 === 0 || done === total) {
         const elapsedS = (Date.now() - startedAt) / 1000;

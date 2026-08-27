@@ -96,7 +96,7 @@ clean up.
 
 ```
 R2 bucket: tao-bronze/
-  chain/events/{block_range}.parquet          # raw System.Events blobs, unparsed hex
+  chain/events/{block_range}.parquet          # raw System.Events + Timestamp.Now blobs, unparsed hex, per block
   chain/metadata/{spec_version}.parquet       # runtime metadata, one row per upgrade
   prices/{exchange}/{pair}/{yyyy-mm}.parquet  # raw klines
   chain/checkpoints/{date}.parquet            # monthly reconciliation snapshots
@@ -235,9 +235,17 @@ undercount versus aggregators, especially in early history. Label it.
 - **Substrate JSON-RPC, not EVM.** `state_getStorage`, `state_getKeysPaged`, `chain_getBlockHash`,
   `state_getMetadata`.
 
-Per block, the event capture is two calls: `chain_getBlockHash(n)`, then `state_getStorage` at the
-constant `System.Events` key (`twox128("System") ++ twox128("Events")`). The response is stored as
-raw hex. **No decoding happens during ingestion** — that is what makes bronze re-parseable.
+Per block, the event capture is **three** calls, not two as originally scoped here:
+`chain_getBlockHash(n)`, `state_getStorage` at the constant `System.Events` key
+(`twox128("System") ++ twox128("Events")`), and `state_getStorage` at `Timestamp.Now`
+(`twox128("Timestamp") ++ twox128("Now")`). The third call was added during Phase 2.1/2.2 — every
+downstream metric (§7.1 daily wallet counts, §7.3 "mark each inflow at the composite price at that
+block's timestamp") needs a real per-block timestamp, and capturing it during the one pass over
+each block is cheap next to *not* capturing it and needing a second full backfill later just to add
+it (§10: "Filtered event capture blocks v2" is the same argument applied to a second field, not a
+second pallet). **This changes the RU sizing below by ~50%** — see the note under "Plans." Every
+response is stored as raw hex. **No decoding happens during ingestion** — that is what makes bronze
+re-parseable.
 
 **GATE — Spike G, do this before writing any chain code (§6, Phase 0):**
 
@@ -273,7 +281,20 @@ raw hex. **No decoding happens during ingestion** — that is what makes bronze 
   included quota covers it with no overage. On Standard the same pull costs $9 + ~$65 in overage
   *and* takes ~12.5 days at 1,000 req/min instead of ~25 hours. Pro is both cheaper and faster for
   this month.
-- Steady state: **Standard, $9/mo** — head-of-chain indexing is ~430k RU/month, 10x headroom.
+  **This 9–18M RU figure predates the third call above and needs re-checking before 2.3 starts.**
+  It was sized against a 2-calls/block design; the real implementation is 3 calls/block (+50%),
+  which projects to roughly **13.5–27M RU** — the top of that range would overshoot Pro's 20M
+  quota. The free-tier findings above measured *pacing* (CU/min), not Pro's *per-request RU price*,
+  so this can't be resolved by arithmetic alone: re-run something like Spike G's step 3 — index a
+  few thousand blocks with the real 3-call ingest script (`pnpm chain:ingest`) once Pro is active,
+  read the actual RU delta off the dashboard, and recompute the full 8.9M-block estimate from a
+  measured per-block cost before committing to the backfill. If it lands above 20M, either accept
+  Standard-tier overage for that month or drop the timestamp call and backfill it separately later
+  (against the "no second backfill" argument above, but possibly still cheaper than the overage).
+- Steady state: **Standard, $9/mo** — head-of-chain indexing is ~430k RU/month, 10x headroom. Also
+  based on the 2-call design; head-of-chain indexing is one block at a time regardless, so the +50%
+  here is small in absolute terms (~645k RU/month) and Standard's headroom easily absorbs it — this
+  one doesn't need re-measuring before going ahead.
 
 Build **retry-with-backoff** from the start. Requests over the per-minute limit are rejected
 outright, not queued. Failed requests are not billed.
@@ -431,7 +452,139 @@ Zero dollars spent to this point.
 2.3 does not start until 2.1 and 2.2 are green *and* Phase 1's composite is validated — §11 explains
 why a wrong price series poisons a year of cost-basis assignments that cannot be cheaply recomputed.
 
-**Done when:** the full event index is in bronze and reconciles against monthly checkpoints.
+**Before 2.3 runs at full scale, two things the 2.1/2.2 implementation deliberately deferred needed
+addressing — both were called out as simplifications in `ingestChainRange.ts`'s own comments:**
+
+1. **Runtime-upgrade detection — implemented (2026-08-26).** `pnpm chain:backfill`
+   (`packages/ingest/src/scripts/backfillChainEvents.ts`) replaces the Phase 2.1/2.2 tracer-bullet
+   script for the real backfill. It processes the range in `CHAIN_CHUNK_BLOCKS`-sized chunks
+   (default 100,000) and, per chunk, calls `detectRuntimeSegments`
+   (`packages/ingest/src/chain/detectRuntimeUpgrades.ts`) to find every spec_version boundary via
+   binary search (`state_getRuntimeVersion` at O(log range) blocks, not every block — a chunk with
+   no upgrade costs 4 extra RPC calls, not 100,000). Each distinct spec_version's metadata is
+   fetched once and cached to `chain/metadata/{spec_version}.parquet` the first time it's seen, and
+   every bronze events row is stamped with the spec_version actually active over its segment —
+   `materializeChainSilver.ts` already looked up metadata per-row by `spec_version` and failed
+   loudly on a cache miss, so this was purely an ingestion-side fix. Discovered segments are also
+   logged to `/meta/runtime_versions.parquet` (`runtimeVersionsLog.ts`) as an audit trail. The
+   backfill is resumable: `backfillCheckpoint.ts` writes `/meta/chain_backfill_checkpoint.json`
+   after each chunk's bronze is durably written, so a restart resumes at the next chunk instead of
+   redoing the range or silently skipping blocks (bronze file names are block-range-keyed, so
+   redoing an uncommitted chunk after a crash just overwrites the same file with the same bytes).
+   `TO_BLOCK` defaults to the live chain head via `chain_getHeader` (`fetchChainHead.ts`) rather than
+   a hardcoded genesis-to-date estimate.
+2. **RU sizing / throughput re-measured on Pro (2026-08-26), and it surfaced a second gap beyond
+   RU cost.** Two real samples against Pro, both via `pnpm chain:ingest` on recent (non-genesis)
+   windows:
+   - **Sample 1** — blocks 8,918,000–8,920,000 (2,001 blocks), `CHAIN_CONCURRENCY=1` (the original
+     sequential fetch), `CHAIN_MAX_RPM=2000`. Result: 6,006 RPC calls in **877s** — only ~6.85
+     calls/s, nowhere near the 2000/min (33/s) cap. The bottleneck was per-call network round-trip
+     latency (~270ms), not the rate limit, because every call was awaited one at a time. Projected
+     over the full ~8.9M-block range: **~45 days** — far past the plan's ~25–37h estimate.
+   - **Fix implemented**: `fetchBlockRange` (`packages/ingest/src/chain/fetchBlockRange.ts`) now
+     takes a `concurrency` option and fetches multiple blocks in flight via a worker pool (each
+     block's two `state_getStorage` reads also go out concurrently once its hash is known), instead
+     of one block at a time. Order-preserving, fails loudly and stops scheduling new work on the
+     first error. Both `chain:ingest` and `chain:backfill` expose this as `CHAIN_CONCURRENCY`
+     (default 1, unchanged behavior unless set).
+   - **Sample 2** — a fresh window, blocks 8,920,001–8,922,000 (2,000 blocks),
+     `CHAIN_CONCURRENCY=20`, `CHAIN_MAX_RPM=3000`. Result: 6,003 calls in **123s** — ~7x faster than
+     Sample 1. The log shows *why*: the first ~2,900 calls landed in ~11s (a genuine ~260 calls/s
+     burst rate), then execution stalled for ~50s once the 3000/min sliding-window budget was
+     exhausted, before resuming at the same burst rate for the remainder. **This means concurrency
+     removed the latency bottleneck entirely — the rate limiter (`CHAIN_MAX_RPM`) is now the actual
+     constraint**, and the achievable burst rate (~260 calls/s) comfortably exceeds Pro's documented
+     200 calls/s (12,000 req/min) cap. Sustaining close to that cap over the full backfill projects
+     to **~37 hours** — matching the plan's original estimate — *if* Pro's server-side limiter
+     accepts sustained traffic at that rate without extended 429 backoff; this hasn't been confirmed
+     against a run long enough to find the real sustained ceiling (both samples were short bursts
+     against a fairly low `CHAIN_MAX_RPM` cap, not a sustained run near Pro's actual limit).
+   - **Follow-up samples (same day) isolated the real bottleneck and found two more bugs.** A
+     20,001-block sample at `CHAIN_CONCURRENCY=80` hit the *same* ~9s-burst/~52s-idle throughput
+     cycle as concurrency 30 (110.9 vs. 104.7 calls/s — barely different). Suspecting the client's
+     own rate limiter, `rpcClient.ts`'s limiter was rewritten from a sliding window (which frees an
+     entire minute's budget in one lump when the oldest call ages out — the likely source of the
+     burst/stall cycle) to a continuously-refilling token bucket; a dedicated test locks in the
+     smooth-refill behavior. Rerunning the same scenario, though, reproduced the *identical*
+     burst/stall cycle at nearly the same throughput (117.7 calls/s) — proving the limiter was never
+     the actual bottleneck (a token bucket with unused headroom cannot itself impose a wait). A
+     third sample at `CHAIN_CONCURRENCY=200` confirmed it again (112.8 calls/s, same cycle). **Real
+     sustained throughput plateaus at ~110-120 calls/s regardless of concurrency (30/80/200) or
+     limiter design — almost certainly a soft, non-429 throttle on Blockmachine's side.** Revised
+     full-backfill projection at this ceiling: **~65-70 hours (~2.7-3 days)**.
+   - **Two bugs found and fixed along the way, both real risks to the actual backfill:**
+     1. `packages/ingest/src/bronze/parquetWriter.ts` built the whole NDJSON payload as one JS
+        string (`rows.map(...).join("\n")`) before writing — a 20,001-block sample's combined
+        payload exceeded V8's ~512MB-1GB single-string ceiling (`RangeError: Invalid string
+        length`), and the default full-backfill chunk size (100,000 blocks) is 5x larger. Fixed by
+        streaming rows to disk one at a time; a ~100MB regression test locks this in.
+     2. The fix above initially left the staging-file cleanup only around the later DuckDB step —
+        a failure during the write itself (found for real via a subsequent `ENOSPC`: the write
+        host's disk was nearly full independent of this work, ~920MB free out of 381GB) skipped
+        cleanup entirely, leaking a large temp file. Fixed by widening the `finally` to cover the
+        whole staging-then-copy sequence; a regression test forces a write failure and asserts no
+        temp file survives it.
+   - **RU cost itself**: still needs reading off the Blockmachine dashboard for these samples
+     (~192,000 combined RPC calls across the day) to confirm the ~13.5–27M RU projection before
+     committing Pro's 20M monthly quota to the full pull.
+   - **Open before a full run:** the write host needs real free disk space — some block ranges
+     produce staging files far larger than a typical 20,001-block sample, and the full backfill's
+     default 100,000-block chunks will be worse. 920MB free is not enough headroom. (Resolved same
+     day — the low free space turned out to be unrelated browser cache growth, not this work; 8.9GB
+     free confirmed before the full run started.)
+   - **The full backfill started 2026-08-26**, `FROM_BLOCK=1`, `CHAIN_CHUNK_BLOCKS=20000`,
+     `CHAIN_MAX_RPM=11500`, `CHAIN_CONCURRENCY=50`, `TO_BLOCK` auto-pinned to the head at start
+     (8,929,643) via the checkpoint (see next bullet). User-run in their own terminal, not tied to
+     an agent session, given the ~2.7-3 day duration.
+   - **Checkpoint resumability fix**: if `TO_BLOCK` is left unset, `backfillChainEvents.ts` used to
+     re-resolve "current chain head" on *every* run — which moves every ~12s, so a restart's
+     recomputed `toBlock` would never match the checkpoint's pinned value, silently discarding
+     resumability and restarting from `FROM_BLOCK`. Fixed: `readCheckpointToBlock` in
+     `backfillCheckpoint.ts` looks up a previous run's pinned `toBlock` for the same `fromBlock`
+     (ignoring whatever the caller would otherwise recompute) so the head is resolved exactly once,
+     on the very first run, and every subsequent restart reuses it automatically.
+
+**Monthly reconciliation checkpoints — implemented 2026-08-26, ahead of full-backfill completion,
+against whatever prefix of history is already backfilled** (valid because the backfill runs
+genesis-forward, so any completed prefix is a real, contiguous slice of history with no missing
+baseline — the same property that makes it safe to build Phase 3 metrics against a partial range,
+see below). Two real gaps found and fixed:
+
+1. **`reconcileBalances` double-counted history for any non-genesis window.** It loaded *every*
+   event currently in silver regardless of the requested range and folded all of them on top of a
+   real on-chain baseline taken at `fromBlock - 1` — correct only when `fromBlock = 1` (nothing
+   exists before genesis to double-count), which is the only way it had ever been invoked (Phase
+   2.2). The first non-genesis checkpoint would have folded pre-window events a second time on top
+   of a baseline that already reflected them. Fixed: events are now filtered to
+   `fromBlock <= blockNumber <= toBlock` before folding.
+2. **No incremental checkpoint runner existed** — `reconcileBalances` only ever checked one
+   caller-supplied window, with no way to chain windows together efficiently. Added
+   `knownGoodBalances` (optional) to `reconcileBalances`: coldkeys already validated by an earlier
+   checkpoint are carried forward as trusted starting balances instead of re-fetching a real
+   on-chain read for them, and the function now returns the full resulting `balances` map (not just
+   touched-coldkey rows) so it composes across checkpoints. `runReconciliationCheckpoints.ts`
+   (`pnpm chain:reconcile-checkpoints`, env: `FROM_BLOCK`, `UP_TO_BLOCK`,
+   `CHECKPOINT_INTERVAL_BLOCKS` default 216,000 ≈ 30 days at 12s/block) walks consecutive windows
+   from genesis to `UP_TO_BLOCK` (normally whatever `chain:materialize-silver` has actually decoded,
+   *not* the live chain head), threading validated balances forward — the same idea as reconciling a
+   bank statement against last month's already-agreed closing balance rather than re-checking your
+   entire transaction history every month. Both changes are covered by fixture-backed tests using
+   the recorded real metadata in `fixtures/chain/` (no live chain access needed to test).
+
+**Still not run for real**: `chain:reconcile-checkpoints` hasn't been executed against the actual
+in-progress backfill yet — needs `chain:materialize-silver` run first against current bronze, then
+`UP_TO_BLOCK` set to whatever block that covers. Also not yet built: persisting each checkpoint's
+raw `System.Account` reads to `chain/checkpoints/{date}.parquet` per §2's bronze layout (currently
+the checkpoint reads happen but aren't archived to bronze) — deferred, not required to validate the
+fold's correctness, only to avoid re-fetching the same ground-truth reads if reconciliation is rerun.
+
+**Done when:** the partial event index is in bronze, reconciles against monthly checkpoints, and
+every row's `spec_version` reflects the runtime actually active at that block. (Relaxed from "full"
+to "partial" 2026-08-26 — the full genesis-to-head backfill takes ~2.7-3 days and runs
+independently in the background; 2.3's tooling and correctness can be, and are, fully validated
+against whatever prefix is complete so far, same reasoning as the reconciliation-checkpoint design
+below. Re-run `chain:reconcile-checkpoints` with a larger `UP_TO_BLOCK` as the backfill progresses;
+nothing here needs to wait for 100%.)
 
 ### Phase 3 — Chain metrics (chart 4, plus exchanges)
 

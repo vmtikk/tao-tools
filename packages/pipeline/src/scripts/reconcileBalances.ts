@@ -1,3 +1,4 @@
+import { createBlockmachineClient } from "@tao-tools/ingest";
 import { reconcileBalances } from "../chain/reconcileBalances.js";
 
 async function main(): Promise<void> {
@@ -10,9 +11,13 @@ async function main(): Promise<void> {
 
   const fromBlock = Number(process.env.FROM_BLOCK ?? 1);
   const toBlock = Number(process.env.TO_BLOCK ?? 1000);
+  const client = createBlockmachineClient({
+    apiKey,
+    maxRequestsPerMinute: Number(process.env.CHAIN_MAX_RPM ?? 40),
+  });
 
   console.log(`Reconciling balances for blocks ${fromBlock}-${toBlock}...`);
-  const result = await reconcileBalances({ fromBlock, toBlock, apiKey });
+  const result = await reconcileBalances({ fromBlock, toBlock, client });
 
   console.log(`Baseline block: ${result.fromBlock - 1} (${result.startBlockHash})`);
   console.log(`End block: ${result.toBlock} (${result.endBlockHash})`);

@@ -54,37 +54,66 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Sliding-window (not fixed-bucket) limiter: waits until the oldest call in
- * the trailing 60s ages out rather than bursting up to the cap every minute
- * boundary. */
-class SlidingWindowLimiter {
-  private readonly callTimestamps: number[] = [];
+/**
+ * Token-bucket limiter. Replaces an earlier sliding-window design that
+ * tracked every call's timestamp and, once the window filled up, blocked
+ * until the *oldest* call aged out all at once — which produces a bursty
+ * "drain the whole freed window in a few seconds, then stall for most of a
+ * minute" cycle under concurrent load, not a smooth rate. Measured against a
+ * real 20,000-block sample on Blockmachine Pro (2026-08-26,
+ * tao-analytics-plan.md §6): raising concurrency 30->80 under the old
+ * limiter barely moved sustained throughput (104.7 -> 110.9 calls/s) because
+ * the bottleneck was that stall cycle, not concurrency or Pro's real
+ * capacity (zero 429s across ~180,000 calls that day).
+ *
+ * A token bucket refills continuously instead of releasing a whole window's
+ * capacity at once, so a caller only ever waits for the fraction of a second
+ * until enough tokens accrue for its own request — no long stall waiting for
+ * unrelated older calls to age out. The bucket starts full (an initial burst
+ * up to `maxPerMinute` is allowed, matching what a real caller bounded by
+ * `concurrency` would produce anyway), then steady-state throughput is
+ * limited only by the refill rate, i.e. exactly `maxPerMinute` on average.
+ */
+class TokenBucketLimiter {
+  private readonly capacity: number;
+  private readonly refillPerMs: number;
+  private tokens: number;
+  private lastRefillMs: number;
 
   constructor(
-    private readonly maxPerMinute: number,
+    maxPerMinute: number,
     private readonly sleep: (ms: number) => Promise<void>,
-  ) {}
+  ) {
+    this.capacity = maxPerMinute;
+    this.refillPerMs = maxPerMinute / 60_000;
+    this.tokens = maxPerMinute;
+    this.lastRefillMs = Date.now();
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const elapsedMs = now - this.lastRefillMs;
+    if (elapsedMs <= 0) return;
+    this.tokens = Math.min(this.capacity, this.tokens + elapsedMs * this.refillPerMs);
+    this.lastRefillMs = now;
+  }
 
   async acquire(): Promise<void> {
-    const windowMs = 60_000;
     for (;;) {
-      const now = Date.now();
-      while (this.callTimestamps.length > 0 && now - this.callTimestamps[0]! >= windowMs) {
-        this.callTimestamps.shift();
-      }
-      if (this.callTimestamps.length < this.maxPerMinute) {
-        this.callTimestamps.push(now);
+      this.refill();
+      if (this.tokens >= 1) {
+        this.tokens -= 1;
         return;
       }
-      const waitMs = windowMs - (now - this.callTimestamps[0]!) + 25;
-      await this.sleep(waitMs);
+      const waitMs = (1 - this.tokens) / this.refillPerMs;
+      await this.sleep(Math.max(1, waitMs));
     }
   }
 }
 
 export function createBlockmachineClient(opts: BlockmachineClientOptions): BlockmachineClient {
   const { apiKey, rpcUrl = DEFAULT_RPC_URL, maxRequestsPerMinute = 40, sleep = defaultSleep, onProgress } = opts;
-  const limiter = new SlidingWindowLimiter(maxRequestsPerMinute, sleep);
+  const limiter = new TokenBucketLimiter(maxRequestsPerMinute, sleep);
   let requestCount = 0;
 
   async function rawCall<T>(method: string, params: unknown[]): Promise<T> {

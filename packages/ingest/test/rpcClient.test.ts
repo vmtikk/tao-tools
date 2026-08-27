@@ -60,6 +60,40 @@ describe("createBlockmachineClient (contract — fetch is mocked, never a live c
     }
   });
 
+  it("refills continuously rather than waiting for a whole window to age out", async () => {
+    // With maxRequestsPerMinute: 2, exhausting the bucket needs a partial
+    // token (half the per-minute budget), not the full 60s a sliding-window
+    // design would impose while any earlier call is still within the window.
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { result: "ok" }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const client = createBlockmachineClient({ apiKey: "k", maxRequestsPerMinute: 2 });
+      await Promise.all([
+        (async () => {
+          const p = client.call("chain_getBlockHash", [1]);
+          await vi.advanceTimersByTimeAsync(0);
+          await p;
+        })(),
+      ]);
+      const p2 = client.call("chain_getBlockHash", [2]);
+      await vi.advanceTimersByTimeAsync(0);
+      await p2;
+      expect(client.requestCount).toBe(2);
+
+      const third = client.call("chain_getBlockHash", [3]);
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(client.requestCount).toBe(2); // not yet — under half the 60s window
+
+      await vi.advanceTimersByTimeAsync(1_100); // crosses the ~30s mark for 1/2 tokens/min
+      await third;
+      expect(client.requestCount).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retries a 429 after the server-specified retry-after, then succeeds", async () => {
     const fetchMock = vi
       .fn()

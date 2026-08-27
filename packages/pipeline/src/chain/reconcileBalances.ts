@@ -4,9 +4,11 @@ import {
   asRao,
   reconstructBalances,
   type BalanceEvent,
+  type BalanceMap,
   type Coldkey,
+  type Rao,
 } from "@tao-tools/core";
-import { createBlockmachineClient, systemAccountKey, type BlockmachineClient } from "@tao-tools/ingest";
+import { systemAccountKey, type BlockmachineClient } from "@tao-tools/ingest";
 import { withDuckDb } from "../duckdb/session.js";
 import { resolveBronzeUri, silverDir } from "../paths.js";
 import { buildRegistry } from "./decodeEvents.js";
@@ -32,9 +34,20 @@ export interface ReconcileBalancesResult {
   endBlockHash: string;
   touchedAccounts: number;
   rows: ReconciliationRow[];
+  /**
+   * Full balance state as of `toBlock`, covering every coldkey carried in
+   * via `knownGoodBalances` plus anything newly touched by this window's
+   * events. Pass this straight back in as the *next* checkpoint's
+   * `knownGoodBalances` — that's what makes consecutive checkpoints
+   * incremental instead of re-folding genesis-to-date every time.
+   */
+  balances: BalanceMap;
 }
 
-async function loadEventsFromSilver(): Promise<BalanceEvent[]> {
+/** Exported so a multi-checkpoint caller (`runReconciliationCheckpoints.ts`)
+ * can load silver once and pass the same array to every checkpoint's
+ * `reconcileBalances` call, instead of re-reading disk per checkpoint. */
+export async function loadEventsFromSilver(): Promise<BalanceEvent[]> {
   const transfersPath = `${silverDir()}/transfers.parquet`;
   const balanceEventsPath = `${silverDir()}/balance_events.parquet`;
 
@@ -113,35 +126,60 @@ async function loadRegistryForBlock(client: BlockmachineClient, blockHash: strin
 }
 
 /**
- * tao-analytics-plan.md §6, Phase 2.2: folds every silver balance event into
- * a `BalanceMap` (§7.1's reducer) and reconciles each touched coldkey against
- * a real `System.Account` read at the range's end block. "If reconstructed
- * != actual, the fold is wrong and it is 1,000 blocks of debugging, not
- * 8.9M" — this is that debugging tool, not a one-shot assertion: it reports
- * every mismatch, not just whether any exist.
+ * tao-analytics-plan.md §6, Phase 2.2: folds silver balance events for
+ * [fromBlock, toBlock] into a `BalanceMap` (§7.1's reducer) and reconciles
+ * each coldkey touched in that window against a real `System.Account` read
+ * at the window's end block. "If reconstructed != actual, the fold is wrong
+ * and it is 1,000 blocks of debugging, not 8.9M" — this is that debugging
+ * tool, not a one-shot assertion: it reports every mismatch, not just
+ * whether any exist.
  *
- * The fold does NOT start from an empty balance map. First run against
- * blocks 1-1000 (genesis) surfaced a real gap this way: several coldkeys
- * were pre-funded directly in genesis state — tens of thousands of TAO each,
- * present in `System.Account` at block 0 with no `Balances.Deposit` event
- * ever emitted for it (genesis state is constructed directly, not by
- * executing block 1, so there's nothing to emit an event). A fold starting
- * from zero can never reconcile that; it isn't a bug in the fold, it's a
- * baseline problem. The fix generalizes to any window, not just genesis:
- * seed the map from a real `System.Account` snapshot at `fromBlock - 1`
- * (the state immediately before this range's first event could apply) for
- * every coldkey the range's events touch, then fold forward from there.
+ * **Events are filtered to the window** (`fromBlock <= blockNumber <=
+ * toBlock`) before folding — this was not true of the original Phase 2.2
+ * version, which folded *every* event currently in silver regardless of the
+ * requested range. That was invisible as a bug as long as every call started
+ * at genesis (fromBlock=1, where "everything before fromBlock" is empty by
+ * definition), but folding the full history on top of a `knownGoodBalances`/
+ * on-chain baseline already representing state as of `fromBlock - 1` would
+ * double-count every event before `fromBlock` for any later window — exactly
+ * what `runReconciliationCheckpoints.ts`'s incremental, non-genesis windows
+ * need not to happen.
+ *
+ * **`knownGoodBalances` (optional) carries forward a previously-validated
+ * state** instead of re-fetching a real on-chain baseline for coldkeys
+ * already reconciled in an earlier checkpoint — the efficiency half of
+ * "checkpoint," not just correctness: only coldkeys newly touched in *this*
+ * window need a fresh `System.Account` read. Coldkeys absent from both the
+ * window's events and `knownGoodBalances` were never touched at all, by
+ * definition, and don't need one either — same reasoning `runReconciliation
+ * Checkpoints.ts` relies on to skip most of the ledger, most checkpoints.
+ *
+ * The very first window (whatever its `fromBlock`) still needs a real
+ * on-chain baseline for anything newly touched — that's what surfaced the
+ * genesis-funded-accounts gap originally: several coldkeys were pre-funded
+ * directly in genesis state, present in `System.Account` at block 0 with no
+ * `Balances.Deposit` event ever emitted for it (genesis state is constructed
+ * directly, not by executing block 1). A fold seeded from zero can never
+ * reconcile that — it isn't a bug in the fold, it's a baseline problem, and
+ * it generalizes: any coldkey touched for the first time in a window needs a
+ * real snapshot at that window's start, not an assumed zero.
  */
 export async function reconcileBalances(opts: {
   fromBlock: number;
   toBlock: number;
-  apiKey: string;
-  maxRequestsPerMinute?: number;
+  client: BlockmachineClient;
+  knownGoodBalances?: BalanceMap;
+  /** Pre-loaded events, so a multi-checkpoint caller can load silver once
+   * instead of once per checkpoint. Defaults to a fresh read from silver. */
+  events?: readonly BalanceEvent[];
 }): Promise<ReconcileBalancesResult> {
-  const events = await loadEventsFromSilver();
+  const allEvents = opts.events ?? (await loadEventsFromSilver());
+  const windowEvents = allEvents.filter((e) => e.blockNumber >= opts.fromBlock && e.blockNumber <= opts.toBlock);
+
+  const knownGoodBalances = opts.knownGoodBalances ?? new Map<Coldkey, Rao>();
 
   const touchedColdkeys = new Set<Coldkey>();
-  for (const event of events) {
+  for (const event of windowEvents) {
     if (event.kind === "transfer") {
       touchedColdkeys.add(event.from);
       touchedColdkeys.add(event.to);
@@ -150,29 +188,37 @@ export async function reconcileBalances(opts: {
     }
   }
 
-  const client = createBlockmachineClient({ apiKey: opts.apiKey, maxRequestsPerMinute: opts.maxRequestsPerMinute });
+  const client = opts.client;
   const startBlockHash = await client.call<string>("chain_getBlockHash", [opts.fromBlock - 1]);
   const endBlockHash = await client.call<string>("chain_getBlockHash", [opts.toBlock]);
   const registry = await loadRegistryForBlock(client, endBlockHash);
 
-  const baseline = new Map<Coldkey, bigint>();
-  for (const coldkey of touchedColdkeys) {
+  // Only coldkeys touched here for the first time (not already carried
+  // forward from a prior, validated checkpoint) need a real on-chain read.
+  const newlyTouched = [...touchedColdkeys].filter((coldkey) => !knownGoodBalances.has(coldkey));
+  const freshBaseline = new Map<Coldkey, Rao>();
+  for (const coldkey of newlyTouched) {
     const key = systemAccountKey(coldkey);
     const hex = await client.call<string | null>("state_getStorage", [key, startBlockHash]);
-    baseline.set(coldkey, decodeFreeBalance(registry, hex));
+    freshBaseline.set(coldkey, asRao(decodeFreeBalance(registry, hex)));
   }
 
-  const initial = new Map(Array.from(baseline, ([coldkey, rao]) => [coldkey, asRao(rao)] as const));
-  const reconstructed = reconstructBalances(events, initial);
+  const initial = new Map<Coldkey, Rao>(knownGoodBalances);
+  for (const [coldkey, rao] of freshBaseline) {
+    initial.set(coldkey, rao);
+  }
+
+  const reconstructed = reconstructBalances(windowEvents, initial);
 
   const rows: ReconciliationRow[] = [];
-  for (const [coldkey, reconstructedRao] of reconstructed) {
+  for (const coldkey of touchedColdkeys) {
     const key = systemAccountKey(coldkey);
     const accountInfoHex = await client.call<string | null>("state_getStorage", [key, endBlockHash]);
     const actualRao = decodeFreeBalance(registry, accountInfoHex);
+    const reconstructedRao = reconstructed.get(coldkey) ?? 0n;
     rows.push({
       coldkey,
-      baselineRao: baseline.get(coldkey) ?? 0n,
+      baselineRao: initial.get(coldkey) ?? 0n,
       reconstructedRao,
       actualRao,
       matches: reconstructedRao === actualRao,
@@ -186,5 +232,6 @@ export async function reconcileBalances(opts: {
     endBlockHash,
     touchedAccounts: rows.length,
     rows,
+    balances: reconstructed,
   };
 }

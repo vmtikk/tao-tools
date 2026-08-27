@@ -10,6 +10,7 @@ data/silver/
 data/gold/
 data/export/
 data/meta/*.parquet
+data/meta/chain_backfill_checkpoint.json
 
 .env
 .env.local
