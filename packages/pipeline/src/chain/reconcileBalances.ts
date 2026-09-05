@@ -46,53 +46,70 @@ export interface ReconcileBalancesResult {
 
 /** Exported so a multi-checkpoint caller (`runReconciliationCheckpoints.ts`)
  * can load silver once and pass the same array to every checkpoint's
- * `reconcileBalances` call, instead of re-reading disk per checkpoint. */
-export async function loadEventsFromSilver(): Promise<BalanceEvent[]> {
+ * `reconcileBalances` call, instead of re-reading disk per checkpoint.
+ *
+ * `maxBlock` (optional) pushes a `block_number <=` bound down into both SQL
+ * queries so DuckDB never materializes rows past the caller's actual range
+ * of interest — found for real (2026-09-05): unfiltered, this pulled the
+ * *entire* silver history (~95M rows against a ~5.8M-block backfill prefix)
+ * into memory regardless of `UP_TO_BLOCK`, OOMing even for a caller that only
+ * wanted the first few checkpoints. */
+export async function loadEventsFromSilver(maxBlock?: number): Promise<BalanceEvent[]> {
   const transfersPath = `${silverDir()}/transfers.parquet`;
   const balanceEventsPath = `${silverDir()}/balance_events.parquet`;
+  const blockFilter = maxBlock !== undefined ? `WHERE block_number <= ${Math.trunc(maxBlock)}` : "";
 
-  return withDuckDb(async (connection) => {
-    const events: BalanceEvent[] = [];
+  return withDuckDb(
+    async (connection) => {
+      const events: BalanceEvent[] = [];
 
-    const transferRows = await connection
-      .run(
-        `SELECT block_number, event_index, from_coldkey, to_coldkey, amount_rao
-         FROM read_parquet('${escapeSqlLiteral(transfersPath)}')
-         ORDER BY block_number, event_index;`,
-      )
-      .then((r) => r.getRows());
-    for (const row of transferRows) {
-      events.push({
-        kind: "transfer",
-        blockNumber: asBlockNumber(Number(row[0])),
-        eventIndex: Number(row[1]),
-        from: asColdkey(String(row[2])),
-        to: asColdkey(String(row[3])),
-        amount: asRao(BigInt(row[4] as bigint)),
-      });
-    }
+      const transferRows = await connection
+        .run(
+          `SELECT block_number, event_index, from_coldkey, to_coldkey, amount_rao
+           FROM read_parquet('${escapeSqlLiteral(transfersPath)}')
+           ${blockFilter}
+           ORDER BY block_number, event_index;`,
+        )
+        .then((r) => r.getRows());
+      for (const row of transferRows) {
+        events.push({
+          kind: "transfer",
+          blockNumber: asBlockNumber(Number(row[0])),
+          eventIndex: Number(row[1]),
+          from: asColdkey(String(row[2])),
+          to: asColdkey(String(row[3])),
+          amount: asRao(BigInt(row[4] as bigint)),
+        });
+      }
 
-    const balanceEventRows = await connection
-      .run(
-        `SELECT block_number, event_index, kind, coldkey, amount_rao
-         FROM read_parquet('${escapeSqlLiteral(balanceEventsPath)}')
-         ORDER BY block_number, event_index;`,
-      )
-      .then((r) => r.getRows());
-    for (const row of balanceEventRows) {
-      const kind = String(row[2]) as "deposit" | "withdraw";
-      events.push({
-        kind,
-        blockNumber: asBlockNumber(Number(row[0])),
-        eventIndex: Number(row[1]),
-        coldkey: asColdkey(String(row[3])),
-        amount: asRao(BigInt(row[4] as bigint)),
-      });
-    }
+      const balanceEventRows = await connection
+        .run(
+          `SELECT block_number, event_index, kind, coldkey, amount_rao
+           FROM read_parquet('${escapeSqlLiteral(balanceEventsPath)}')
+           ${blockFilter}
+           ORDER BY block_number, event_index;`,
+        )
+        .then((r) => r.getRows());
+      for (const row of balanceEventRows) {
+        const kind = String(row[2]) as "deposit" | "withdraw";
+        events.push({
+          kind,
+          blockNumber: asBlockNumber(Number(row[0])),
+          eventIndex: Number(row[1]),
+          coldkey: asColdkey(String(row[3])),
+          amount: asRao(BigInt(row[4] as bigint)),
+        });
+      }
 
-    events.sort((a, b) => a.blockNumber - b.blockNumber || a.eventIndex - b.eventIndex);
-    return events;
-  });
+      events.sort((a, b) => a.blockNumber - b.blockNumber || a.eventIndex - b.eventIndex);
+      return events;
+    },
+    // See session.ts's memoryLimit doc comment: DuckDB auto-sizes its buffer
+    // pool against *total* system RAM, which is too optimistic when other
+    // processes (chain:backfill, materialize-silver) already hold a lot of
+    // it — found for real 2026-09-05 running this against ~95M real events.
+    { memoryLimit: "3GB" },
+  );
 }
 
 async function loadRegistryForBlock(client: BlockmachineClient, blockHash: string): Promise<TypeRegistry> {

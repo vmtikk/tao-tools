@@ -109,3 +109,184 @@
     ORDER BY timestamp_ms
   changelog:
     - v1: initial (Phase 2.1)
+
+- name: account_balances_daily
+  version: 1
+  definition: >
+    Per-coldkey free balance (rao) at the end of each UTC day, one row per
+    (coldkey, day) that had at least one balance-affecting event that day —
+    NOT forward-filled to every calendar day (§7.1: "reconstruct balances
+    locally for every day", but density here is bounded by activity, not by
+    the full days x coldkeys cross product, which is intractable at
+    real chain scale — see wallet_count_* for how the sparse form gets
+    turned into a continuous daily series without materializing that cross
+    product). Folds silver_transfers (signed +/- to the two legs) and
+    silver_balance_events (deposit=+, withdraw=-) into one signed delta
+    stream per coldkey, running-sums it in event order (block_number,
+    event_index — never wall-clock), then keeps only the last balance of
+    each UTC day. Internal base table, not a chart — see wallet_count_*.
+  params: {}
+  depends_on: []
+  export: false
+  sql: >
+    WITH deltas AS (
+      SELECT from_coldkey AS coldkey, block_number, event_index, timestamp_ms, -amount_rao AS delta_rao
+      FROM silver_transfers
+      UNION ALL
+      SELECT to_coldkey AS coldkey, block_number, event_index, timestamp_ms, amount_rao AS delta_rao
+      FROM silver_transfers
+      UNION ALL
+      SELECT coldkey, block_number, event_index, timestamp_ms,
+             CASE kind WHEN 'deposit' THEN amount_rao ELSE -amount_rao END AS delta_rao
+      FROM silver_balance_events
+    ),
+    running AS (
+      SELECT coldkey, block_number, event_index,
+             (timestamp_ms // 86400000) * 86400000 AS day_ms,
+             SUM(delta_rao) OVER (
+               PARTITION BY coldkey ORDER BY block_number, event_index
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) AS balance_rao
+      FROM deltas
+    ),
+    last_per_day AS (
+      SELECT coldkey, day_ms, balance_rao,
+             ROW_NUMBER() OVER (
+               PARTITION BY coldkey, day_ms ORDER BY block_number DESC, event_index DESC
+             ) AS rn
+      FROM running
+    )
+    SELECT coldkey, day_ms AS timestamp_ms, balance_rao
+    FROM last_per_day
+    WHERE rn = 1
+    ORDER BY coldkey, timestamp_ms
+  changelog:
+    - v1: initial (Phase 3.1)
+
+- name: wallet_count_free_balance
+  version: 1
+  definition: >
+    Daily count of distinct coldkeys with free balance > 0 (§7.1 series 1) —
+    includes dust and airdrop noise, unlike wallet_count_dust_filtered.
+    Coldkeys only, never hotkeys (§7.1's critical distinction, enforced
+    upstream by account_balances_daily reading only coldkey-branded columns).
+    Detects each coldkey's balance>0 <-> not crossing from the sparse
+    account_balances_daily rows (a crossing can only happen on a row that
+    exists there), turns those crossings into a running count, then carries
+    that count forward across every day in range — including days with no
+    crossings at all — via a gaps-and-islands forward-fill (last non-null
+    value carried across each run of NULLs), so the series is continuous day
+    over day rather than only defined on days something changed.
+  params: {}
+  depends_on: [account_balances_daily]
+  sql: >
+    WITH indicator AS (
+      SELECT coldkey, timestamp_ms, CASE WHEN balance_rao > 0 THEN 1 ELSE 0 END AS ind
+      FROM account_balances_daily
+    ),
+    transitions AS (
+      SELECT coldkey, timestamp_ms, ind,
+             LAG(ind, 1, 0) OVER (PARTITION BY coldkey ORDER BY timestamp_ms) AS prev_ind
+      FROM indicator
+    ),
+    day_deltas AS (
+      SELECT timestamp_ms, SUM(ind - prev_ind) AS delta
+      FROM transitions
+      WHERE ind <> prev_ind
+      GROUP BY timestamp_ms
+    ),
+    running_count AS (
+      SELECT timestamp_ms, SUM(delta) OVER (ORDER BY timestamp_ms) AS value
+      FROM day_deltas
+    ),
+    day_spine AS (
+      -- Bounded by the full account_balances_daily date range (via
+      -- `indicator`), not by running_count's crossing days — a day whose
+      -- only activity doesn't happen to cross *this* threshold (e.g. a
+      -- dust-level withdrawal against the > 0.01 TAO series) must still
+      -- appear in the spine so the forward-fill carries the count through
+      -- it, instead of the series silently truncating at the last crossing.
+      SELECT UNNEST(generate_series(
+        (SELECT MIN(timestamp_ms) FROM indicator),
+        (SELECT MAX(timestamp_ms) FROM indicator),
+        86400000
+      )) AS timestamp_ms
+    ),
+    joined AS (
+      SELECT ds.timestamp_ms, rc.value
+      FROM day_spine ds
+      LEFT JOIN running_count rc ON rc.timestamp_ms = ds.timestamp_ms
+    ),
+    filled AS (
+      SELECT timestamp_ms, value,
+             SUM(CASE WHEN value IS NOT NULL THEN 1 ELSE 0 END) OVER (
+               ORDER BY timestamp_ms ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) AS grp
+      FROM joined
+    )
+    SELECT timestamp_ms, MAX(value) OVER (PARTITION BY grp) AS value
+    FROM filled
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 3.1)
+
+- name: wallet_count_dust_filtered
+  version: 1
+  definition: >
+    Daily count of distinct coldkeys with free balance > 0.01 TAO (§7.1
+    series 3) — strips airdrop and dust noise out of wallet_count_free_balance.
+    Same crossing-detection + forward-fill method as wallet_count_free_balance,
+    just against a 10,000,000 rao (0.01 TAO) threshold instead of > 0.
+  params:
+    dust_threshold_rao: 10000000
+  depends_on: [account_balances_daily]
+  sql: >
+    WITH indicator AS (
+      SELECT coldkey, timestamp_ms, CASE WHEN balance_rao > 10000000 THEN 1 ELSE 0 END AS ind
+      FROM account_balances_daily
+    ),
+    transitions AS (
+      SELECT coldkey, timestamp_ms, ind,
+             LAG(ind, 1, 0) OVER (PARTITION BY coldkey ORDER BY timestamp_ms) AS prev_ind
+      FROM indicator
+    ),
+    day_deltas AS (
+      SELECT timestamp_ms, SUM(ind - prev_ind) AS delta
+      FROM transitions
+      WHERE ind <> prev_ind
+      GROUP BY timestamp_ms
+    ),
+    running_count AS (
+      SELECT timestamp_ms, SUM(delta) OVER (ORDER BY timestamp_ms) AS value
+      FROM day_deltas
+    ),
+    day_spine AS (
+      -- Bounded by the full account_balances_daily date range (via
+      -- `indicator`), not by running_count's crossing days — a day whose
+      -- only activity doesn't happen to cross *this* threshold (e.g. a
+      -- dust-level withdrawal against the > 0.01 TAO series) must still
+      -- appear in the spine so the forward-fill carries the count through
+      -- it, instead of the series silently truncating at the last crossing.
+      SELECT UNNEST(generate_series(
+        (SELECT MIN(timestamp_ms) FROM indicator),
+        (SELECT MAX(timestamp_ms) FROM indicator),
+        86400000
+      )) AS timestamp_ms
+    ),
+    joined AS (
+      SELECT ds.timestamp_ms, rc.value
+      FROM day_spine ds
+      LEFT JOIN running_count rc ON rc.timestamp_ms = ds.timestamp_ms
+    ),
+    filled AS (
+      SELECT timestamp_ms, value,
+             SUM(CASE WHEN value IS NOT NULL THEN 1 ELSE 0 END) OVER (
+               ORDER BY timestamp_ms ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) AS grp
+      FROM joined
+    )
+    SELECT timestamp_ms, MAX(value) OVER (PARTITION BY grp) AS value
+    FROM filled
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 3.1)

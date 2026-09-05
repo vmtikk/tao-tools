@@ -26,6 +26,16 @@
         { "timestampMs": 1770000000000, "value": 2 },
         { "timestampMs": 1770000060000, "value": 1 }
       ]
+    },
+    {
+      "metric": "wallet_count_free_balance",
+      "version": 1,
+      "points": [{ "timestampMs": 1769990400000, "value": 2 }]
+    },
+    {
+      "metric": "wallet_count_dust_filtered",
+      "version": 1,
+      "points": [{ "timestampMs": 1769990400000, "value": 2 }]
     }
   ]
 }

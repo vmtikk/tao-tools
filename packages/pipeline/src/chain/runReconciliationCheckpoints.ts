@@ -56,7 +56,7 @@ export async function runReconciliationCheckpoints(
     throw new Error(`intervalBlocks must be positive, got ${opts.intervalBlocks}`);
   }
 
-  const events = opts.events ?? (await loadEventsFromSilver());
+  const events = opts.events ?? (await loadEventsFromSilver(opts.upToBlock));
   const results: CheckpointResult[] = [];
 
   let knownGoodBalances: BalanceMap = new Map<Coldkey, Rao>();
