@@ -710,6 +710,18 @@ cost.
 **Needs periodic re-auditing** — exchanges rotate wallets. Flag labeled coldkeys that go to zero
 and stay there.
 
+**Seeded 2026-09-05** — `data/meta/exchange_labels.json` has 11 coldkeys from Taostats' own
+`/api/exchange/v1` endpoint (`TAOSTATS_API_KEY` in `.env`; free tier is sufficient, confirmed by
+actually calling it), all at `confidence: "medium"` since this is only the first of the plan's three
+sourcing steps — none of these are cross-referenced against a published proof-of-reserves or
+confirmed by a deposit-and-observe test yet. Two coldkeys each for Kraken and Binance (separate hot/
+cold or operational wallets under the same label); one each for Gate.io, Crypto.com, MEXC, Bitget,
+Bithumb, KuCoin. One entry (Taobridge) is flagged `confidence: "low"` and called out as a cross-chain
+bridge, not a centralized exchange — worth a decision on whether it belongs in the "TAO on exchanges"
+series at all before 3.3 sums balances by label. This clears the plan's own "~10–15 coldkeys" bar
+(§7.2) for wiring up exchange balances at effectively zero further labeling effort, though 3.3 itself
+is still blocked on 3.1's reconciliation the same as everything else downstream of the fold.
+
 ### 7.3 Supply in profit — the hard one
 
 Bittensor is account-based, not UTXO. There is no coin-level cost basis. This is an

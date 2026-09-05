@@ -1,0 +1,79 @@
+[
+  {
+    "coldkey": "5C5FQQSfuxgJc5sHjjAL9RKAzR98qqCV2YN5xAm2wVf1ctGR",
+    "exchange": "Kraken",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Kraken Cold\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5E2b2DcMd5W8MBhzTCFt63t2ZEN8RsRgL7oDd7BFYL9aMQux",
+    "exchange": "Kraken",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Kraken Hot\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5Hd2ze5ug8n1bo3UCAcQsf66VNjKqGos8u6apNfzcU86pg4N",
+    "exchange": "Binance",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Binance\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5GBnPzvPghS8AuCoo6bfnK7JUFHuyUhWSFD4woBNsKnPiEUi",
+    "exchange": "Binance",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — second coldkey labeled \"Binance\" (distinct from 5Hd2ze5...). Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5CNChyk2fnVgVSZDLAVVFb4QBTMGm6WfuQvseBG6hj8xWzKP",
+    "exchange": "Gate.io",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Gate.io\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5CVSCaCXDRydd3Mkdbu2tHLNYxmNTSpy9yRixa1TRGvgRFS8",
+    "exchange": "Crypto.com",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Crypto.com\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5FqBL928choLPmeFz5UVAvonBD5k7K2mZSXVC9RkFzLxoy2s",
+    "exchange": "MEXC",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"MEXC\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5HbDZ6ULuwZegAMSPaS2kaUfBLMDaht5t48RcDrQATSgGCAR",
+    "exchange": "Bitget",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Bitget\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5EP5gJvve4PauTCHoiTcpVgsFCKNwVitBcrJbVYWbR5ZTwnU",
+    "exchange": "Bithumb",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Bithumb\". Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5CrmVKApX6sJybZaL1geHfzvHWeCpbavqrrXgYLCQmhehX2q",
+    "exchange": "KuCoin",
+    "confidence": "medium",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Kucoin\" (capitalization normalized here). Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
+  },
+  {
+    "coldkey": "5HiveMEoWPmQmBAb8v63bKPcFhgTGCmST1TVZNvPHSTKFLCv",
+    "exchange": "Taobridge",
+    "confidence": "low",
+    "date_added": "2026-09-05",
+    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Taobridge\". NOTE: this is a cross-chain bridge protocol, not a centralized exchange — included here for completeness/traceability, but should likely be excluded from (or broken out separately in) the 'TAO on exchanges' chart series (§7.2) rather than folded into exchange balances. Flagged low confidence pending a decision on whether it belongs in this label set at all."
+  }
+]
