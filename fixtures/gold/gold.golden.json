@@ -36,6 +36,11 @@
       "metric": "wallet_count_dust_filtered",
       "version": 1,
       "points": [{ "timestampMs": 1769990400000, "value": 2 }]
+    },
+    {
+      "metric": "exchange_balances_daily",
+      "version": 1,
+      "points": []
     }
   ]
 }

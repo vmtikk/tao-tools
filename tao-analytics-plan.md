@@ -657,6 +657,23 @@ governs: don't build past the reconciled prefix once reconciliation actually run
   typed fallback view instead of erroring — "no deposits/withdraws decoded yet" is a valid empty set,
   not a reason to take down every other metric.
 
+**3.3 built same day — concretely confirms why reconciliation matters, not just in theory.**
+`exchange_balances_daily` (§7.2, sums account_balances_daily for the labeled coldkeys in
+`data/meta/exchange_labels.json`) went **negative** for several days in March 2023 when run against
+real data — down to -9,154.6 TAO on 2023-03-21 — which is impossible for a real on-chain balance.
+Traced to one specific coldkey, `5FqBL928choLPmeFz5UVAvonBD5k7K2mZSXVC9RkFzLxoy2s` (labeled MEXC):
+its very first appearance in the fold is already negative, meaning it sent out TAO our event fold
+never saw it receive — the exact "genesis-funded accounts" gap `reconcileBalances.ts`'s docstring
+already describes (a coldkey funded directly in genesis state, before block 1, with no `Deposit`
+event ever emitted for it — `account_balances_daily` has no genesis baseline at all, unlike
+`reconcileBalances`, which gets one from a real `System.Account` read). Deliberately **not
+patched with a clamp/floor** — a negative number is an honest signal that data is missing; hiding it
+behind `MAX(balance, 0)` would just replace an obviously-wrong number with a plausible-but-still-wrong
+one. The real fix is the same one reconciliation already needs: a real on-chain balance read for any
+coldkey touched before its first fold event, which needs RPC (blocked on RU budget same as
+everything else in §6). Left as further concrete evidence for the "provisional" caveat — first thing
+to check once `chain:reconcile-checkpoints` finally runs.
+
 ### Phase 4 — Supply in profit (chart 5)
 
 | Slice | Delivers |

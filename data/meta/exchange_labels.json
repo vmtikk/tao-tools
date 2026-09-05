@@ -68,12 +68,5 @@
     "confidence": "medium",
     "date_added": "2026-09-05",
     "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Kucoin\" (capitalization normalized here). Taostats-only so far, not yet cross-referenced against a published proof-of-reserves or confirmed by a deposit-and-observe test (tao-analytics-plan.md §7.2)."
-  },
-  {
-    "coldkey": "5HiveMEoWPmQmBAb8v63bKPcFhgTGCmST1TVZNvPHSTKFLCv",
-    "exchange": "Taobridge",
-    "confidence": "low",
-    "date_added": "2026-09-05",
-    "evidence": "Taostats API (https://api.taostats.io/api/exchange/v1) — labeled \"Taobridge\". NOTE: this is a cross-chain bridge protocol, not a centralized exchange — included here for completeness/traceability, but should likely be excluded from (or broken out separately in) the 'TAO on exchanges' chart series (§7.2) rather than folded into exchange balances. Flagged low confidence pending a decision on whether it belongs in this label set at all."
   }
 ]

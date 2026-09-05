@@ -290,3 +290,63 @@
     ORDER BY timestamp_ms
   changelog:
     - v1: initial (Phase 3.1)
+
+- name: exchange_balances_daily
+  version: 1
+  definition: >
+    "TAO on exchanges" (§7.2) — total free balance, in TAO (not rao), held across every coldkey in
+    data/meta/exchange_labels.json, per UTC day, forward-filled across the full account_balances_daily
+    date range (unlike wallet_count_*, this sums real balances for a small fixed set of ~10 labeled
+    coldkeys rather than counting 232K+ coldkeys, so a dense per-coldkey day spine is cheap here — no
+    need for the crossing-detection trick). A labeled coldkey with no activity yet in the currently
+    decoded prefix contributes 0, not an assumed balance. Independent of every other chart (§1) — can
+    ship or slip without blocking anything. Labels are Taostats-sourced only so far (medium
+    confidence, see future-work.md) and Taobridge (a bridge, not an exchange) is deliberately excluded
+    from exchange_labels.json, not filtered here. KNOWN GAP, confirmed against real data
+    2026-09-05 (tao-analytics-plan.md's Phase 3.1 entry): account_balances_daily has no genesis
+    baseline, so a labeled coldkey funded before block 1 with no Deposit event ever recorded for it
+    can make this go negative for real — not clamped, since that would hide the signal that the
+    underlying fold is missing a real on-chain balance read. Do not treat this series as trustworthy
+    until chain:reconcile-checkpoints has actually run clean.
+  params: {}
+  depends_on: [account_balances_daily]
+  sql: >
+    WITH exchange_balances AS (
+      SELECT a.coldkey, a.timestamp_ms, a.balance_rao
+      FROM account_balances_daily a
+      JOIN exchange_labels e ON e.coldkey = a.coldkey
+    ),
+    day_spine AS (
+      SELECT UNNEST(generate_series(
+        (SELECT MIN(timestamp_ms) FROM account_balances_daily),
+        (SELECT MAX(timestamp_ms) FROM account_balances_daily),
+        86400000
+      )) AS timestamp_ms
+    ),
+    coldkey_day_spine AS (
+      SELECT ds.timestamp_ms, e.coldkey
+      FROM day_spine ds
+      CROSS JOIN (SELECT DISTINCT coldkey FROM exchange_labels) e
+    ),
+    joined AS (
+      SELECT cs.coldkey, cs.timestamp_ms, b.balance_rao
+      FROM coldkey_day_spine cs
+      LEFT JOIN exchange_balances b ON b.coldkey = cs.coldkey AND b.timestamp_ms = cs.timestamp_ms
+    ),
+    filled AS (
+      SELECT coldkey, timestamp_ms, balance_rao,
+             SUM(CASE WHEN balance_rao IS NOT NULL THEN 1 ELSE 0 END) OVER (
+               PARTITION BY coldkey ORDER BY timestamp_ms ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) AS grp
+      FROM joined
+    ),
+    forward_filled AS (
+      SELECT coldkey, timestamp_ms, MAX(balance_rao) OVER (PARTITION BY coldkey, grp) AS balance_rao
+      FROM filled
+    )
+    SELECT timestamp_ms, SUM(COALESCE(balance_rao, 0)) / 1e9 AS value
+    FROM forward_filled
+    GROUP BY timestamp_ms
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: initial (Phase 3.3)

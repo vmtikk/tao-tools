@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { withDuckDb } from "../duckdb/session.js";
-import { goldDir, silverDir } from "../paths.js";
+import { goldDir, metaDir, silverDir } from "../paths.js";
 import { loadRegistry } from "../registry/loader.js";
 import { goldFileForMetric } from "../registry/goldFiles.js";
 
@@ -66,6 +66,31 @@ export async function materializeGold(registryPath?: string): Promise<Materializ
             CAST(NULL AS VARCHAR) AS kind,
             CAST(NULL AS VARCHAR) AS coldkey,
             CAST(NULL AS BIGINT) AS amount_rao
+          WHERE FALSE;
+        `);
+      }
+
+      // §7.2's hand-curated coldkey -> exchange label set. Read as a view
+      // (not embedded in registry SQL) so relabeling an exchange never needs
+      // a metric version bump — only the underlying facts changed, not the
+      // definition. Empty-but-typed fallback for the same reason
+      // silver_balance_events has one: no labels yet is a valid empty set.
+      const exchangeLabelsPath = `${metaDir()}/exchange_labels.json`;
+      if (existsSync(exchangeLabelsPath)) {
+        await connection.run(
+          `CREATE OR REPLACE VIEW exchange_labels AS
+           SELECT coldkey, exchange, confidence, date_added, evidence
+           FROM read_json_auto('${escapeSqlLiteral(exchangeLabelsPath)}');`,
+        );
+      } else {
+        await connection.run(`
+          CREATE OR REPLACE VIEW exchange_labels AS
+          SELECT
+            CAST(NULL AS VARCHAR) AS coldkey,
+            CAST(NULL AS VARCHAR) AS exchange,
+            CAST(NULL AS VARCHAR) AS confidence,
+            CAST(NULL AS VARCHAR) AS date_added,
+            CAST(NULL AS VARCHAR) AS evidence
           WHERE FALSE;
         `);
       }
