@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalizeBalanceEvent } from "../src/events/normalize.js";
-import { asBlockNumber, asColdkey, asRao } from "../src/types/brands.js";
+import { normalizeBalanceEvent, normalizeStakeEvent } from "../src/events/normalize.js";
+import { asBlockNumber, asColdkey, asHotkey, asRao } from "../src/types/brands.js";
 
 const BLOCK = asBlockNumber(42);
 
@@ -58,6 +58,50 @@ describe("normalizeBalanceEvent", () => {
   it("returns null for an unhandled balances method", () => {
     expect(
       normalizeBalanceEvent({ section: "balances", method: "Reserved", data: ["5Alice", 1n] }, BLOCK, 0),
+    ).toBeNull();
+  });
+});
+
+describe("normalizeStakeEvent", () => {
+  it("normalizes a pre-dTAO StakeAdded (hotkey, amount)", () => {
+    const result = normalizeStakeEvent(
+      { section: "subtensormodule", method: "StakeAdded", data: ["5Hotkey", 999_999_000n] },
+      BLOCK,
+      0,
+    );
+    expect(result).toEqual({
+      kind: "stakeAdded",
+      blockNumber: BLOCK,
+      eventIndex: 0,
+      hotkey: asHotkey("5Hotkey"),
+      amount: asRao(999_999_000n),
+    });
+  });
+
+  it("normalizes a pre-dTAO StakeRemoved (hotkey, amount)", () => {
+    const result = normalizeStakeEvent(
+      { section: "subtensormodule", method: "StakeRemoved", data: ["5Hotkey", 11_999_998_100n] },
+      BLOCK,
+      1,
+    );
+    expect(result).toEqual({
+      kind: "stakeRemoved",
+      blockNumber: BLOCK,
+      eventIndex: 1,
+      hotkey: asHotkey("5Hotkey"),
+      amount: asRao(11_999_998_100n),
+    });
+  });
+
+  it("returns null for a non-subtensorModule section", () => {
+    expect(
+      normalizeStakeEvent({ section: "balances", method: "StakeAdded", data: ["5Hotkey", 1n] }, BLOCK, 0),
+    ).toBeNull();
+  });
+
+  it("returns null for an unhandled subtensorModule method", () => {
+    expect(
+      normalizeStakeEvent({ section: "subtensormodule", method: "WeightsSet", data: [3, 25] }, BLOCK, 0),
     ).toBeNull();
   });
 });

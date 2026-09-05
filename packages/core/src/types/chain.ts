@@ -1,4 +1,4 @@
-import type { BlockNumber, Coldkey, Rao } from "./brands.js";
+import type { BlockNumber, Coldkey, Hotkey, Rao } from "./brands.js";
 
 /**
  * A decoded `pallet_balances::Event::Transfer`. tao-analytics-plan.md §2 lists
@@ -41,3 +41,38 @@ export interface WithdrawEvent {
  * reconciliation).
  */
 export type BalanceEvent = TransferEvent | DepositEvent | WithdrawEvent;
+
+/**
+ * A decoded `SubtensorModule::StakeAdded` — pre-dTAO shape only (2 fields:
+ * hotkey, amount). Note this is keyed by {@link Hotkey}, not {@link Coldkey}:
+ * the raw event only names the hotkey that gained stake, confirmed against
+ * real bronze data (2026-08-27) by cross-referencing the account against a
+ * `DelegateAdded(coldkey, hotkey, take)` event where it appears on the
+ * hotkey side. Attributing stake to the coldkey that owns it needs a
+ * separate hotkey->coldkey lookup (the `Owner` storage item) — this type
+ * deliberately doesn't pretend to have that yet.
+ */
+export interface StakeAddedEvent {
+  kind: "stakeAdded";
+  blockNumber: BlockNumber;
+  eventIndex: number;
+  hotkey: Hotkey;
+  amount: Rao;
+}
+
+/** A decoded `SubtensorModule::StakeRemoved` — see {@link StakeAddedEvent}. */
+export interface StakeRemovedEvent {
+  kind: "stakeRemoved";
+  blockNumber: BlockNumber;
+  eventIndex: number;
+  hotkey: Hotkey;
+  amount: Rao;
+}
+
+/**
+ * Everything the (future) stake-reconstruction fold knows how to apply.
+ * Deliberately excludes the dTAO/subnet-token era's 6-field StakeAdded/
+ * StakeRemoved (spec_version 438+, netuid-bearing) — that's subnet/alpha-
+ * denominated stake, out of v1 scope (tao-analytics-plan.md §1, §13).
+ */
+export type StakeEvent = StakeAddedEvent | StakeRemovedEvent;

@@ -1,5 +1,5 @@
-import { asColdkey, asRao } from "../types/brands.js";
-import type { BalanceEvent } from "../types/chain.js";
+import { asColdkey, asHotkey, asRao } from "../types/brands.js";
+import type { BalanceEvent, StakeEvent } from "../types/chain.js";
 import type { BlockNumber } from "../types/brands.js";
 
 /**
@@ -51,6 +51,36 @@ export function normalizeBalanceEvent(
     case "Withdraw": {
       const [coldkey, amount] = evt.data as [string, bigint];
       return { kind: "withdraw", blockNumber, eventIndex, coldkey: asColdkey(coldkey), amount: asRao(amount) };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Normalizes a decoded pre-dTAO `SubtensorModule::StakeAdded`/`StakeRemoved`
+ * into a {@link StakeEvent}. See `types/chain.ts`'s `StakeAddedEvent` doc
+ * comment for why this is hotkey-keyed, not coldkey-keyed. Returns null for
+ * any other section/method, including the dTAO-era 6-field shape — the
+ * decode layer (`decodeEvents.ts`) is what filters that out by field count,
+ * this is just the second line of defense against a malformed 2-element
+ * `data` slipping through.
+ */
+export function normalizeStakeEvent(
+  evt: DecodedEvent,
+  blockNumber: BlockNumber,
+  eventIndex: number,
+): StakeEvent | null {
+  if (evt.section !== "subtensormodule") return null;
+
+  switch (evt.method) {
+    case "StakeAdded": {
+      const [hotkey, amount] = evt.data as [string, bigint];
+      return { kind: "stakeAdded", blockNumber, eventIndex, hotkey: asHotkey(hotkey), amount: asRao(amount) };
+    }
+    case "StakeRemoved": {
+      const [hotkey, amount] = evt.data as [string, bigint];
+      return { kind: "stakeRemoved", blockNumber, eventIndex, hotkey: asHotkey(hotkey), amount: asRao(amount) };
     }
     default:
       return null;

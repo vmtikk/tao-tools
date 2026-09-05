@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildRegistry, decodeBalanceEventsForBlock, decodeTimestamp } from "../src/chain/decodeEvents.js";
+import { asHotkey, asRao } from "@tao-tools/core";
+import { buildRegistry, decodeBalanceEventsForBlock, decodeChainEventsForBlock, decodeTimestamp } from "../src/chain/decodeEvents.js";
 
 /**
  * Tier 3 (tao-analytics-plan.md §5): recorded real Blockmachine responses
@@ -56,5 +57,61 @@ describe("decodeEvents (contract — recorded real Blockmachine responses)", () 
   it("decodeTimestamp returns null for a null storage read", () => {
     const registry = buildRegistry(metadataFixture.metadataHex);
     expect(decodeTimestamp(registry, null)).toBeNull();
+  });
+});
+
+/**
+ * Real pre-dTAO StakeAdded/StakeRemoved events (mainnet blocks 90 and 795,
+ * spec_version 101, captured 2026-08-27 from bronze already in R2 — see
+ * fixtures/chain/blocks-stake-events.json). No live RPC needed to record
+ * these: bronze already holds every block's full System.Events blob
+ * unparsed (§10), so pulling a real fixture is a local/R2 read, not a
+ * Blockmachine call.
+ */
+describe("decodeChainEventsForBlock — stake events (contract — recorded real Blockmachine responses)", () => {
+  const metadataFixture = JSON.parse(
+    readFileSync(join(import.meta.dirname, "..", "..", "..", "fixtures", "chain", "metadata-specVersion101.json"), "utf-8"),
+  ) as { metadataHex: string };
+  const stakeFixture = JSON.parse(
+    readFileSync(join(import.meta.dirname, "..", "..", "..", "fixtures", "chain", "blocks-stake-events.json"), "utf-8"),
+  ) as {
+    block90StakeAdded: { blockNumber: number; eventsHex: string };
+    block795StakeRemoved: { blockNumber: number; eventsHex: string };
+  };
+
+  it("decodes a real StakeAdded event, keyed by hotkey", () => {
+    const registry = buildRegistry(metadataFixture.metadataHex);
+    const { stakeEvents } = decodeChainEventsForBlock(
+      registry,
+      stakeFixture.block90StakeAdded.eventsHex,
+      stakeFixture.block90StakeAdded.blockNumber,
+    );
+    expect(stakeEvents).toEqual([
+      {
+        kind: "stakeAdded",
+        blockNumber: 90,
+        eventIndex: expect.any(Number),
+        hotkey: asHotkey("5F4tQyWrhfGVcNhoqeiNsR6KjD4wMZ2kfhLj4oHYuyHbZAc3"),
+        amount: asRao(999_999_000n),
+      },
+    ]);
+  });
+
+  it("decodes a real StakeRemoved event, keyed by hotkey", () => {
+    const registry = buildRegistry(metadataFixture.metadataHex);
+    const { stakeEvents } = decodeChainEventsForBlock(
+      registry,
+      stakeFixture.block795StakeRemoved.eventsHex,
+      stakeFixture.block795StakeRemoved.blockNumber,
+    );
+    expect(stakeEvents).toEqual([
+      {
+        kind: "stakeRemoved",
+        blockNumber: 795,
+        eventIndex: expect.any(Number),
+        hotkey: asHotkey("5F4tQyWrhfGVcNhoqeiNsR6KjD4wMZ2kfhLj4oHYuyHbZAc3"),
+        amount: asRao(11_999_998_100n),
+      },
+    ]);
   });
 });
