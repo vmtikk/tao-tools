@@ -1,0 +1,14 @@
+[Unit]
+Description=Run tao-tools sync every 15 minutes
+
+[Timer]
+# Relative to the *previous run finishing*, not wall-clock-aligned — a slow
+# catch-up run (e.g. after server downtime) simply pushes the next run back
+# instead of overlapping with it.
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=tao-tools bronze-only chain sync (Blockmachine -> R2)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tao-tools
+ExecStart=/opt/tao-tools/sync-bronze.sh
+# Adjust to match `which node` / `which pnpm` on the server (systemd units
+# don't source ~/.bashrc or ~/.profile, so PATH is minimal by default).
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# If pnpm was installed via corepack/nvm under a user home dir instead of a
+# system path, add it here, e.g.:
+# Environment=PATH=/home/youruser/.local/share/pnpm:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=1800
