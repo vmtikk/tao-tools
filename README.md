@@ -19,8 +19,8 @@ impossible; these are the genesis-funded accounts of plan §10 (funded directly 
 so no `Deposit` event ever fires and the fold starts them at zero). Fixing it needs real
 `System.Account` reads — i.e. the same RPC work reconciliation needs. Don't treat wallet counts or
 exchange balances as final until that run comes back clean. RU cost also still needs a
-Blockmachine-dashboard check (§4.2) — the backfill alone spent 569,181 RPC calls on top of the
-~192,000 spent sampling, and reconciliation across 505,493 coldkeys has never been sized.
+Blockmachine-dashboard check (§4.2) — the backfill alone spent roughly 26.8M RPC calls on top of
+the ~192,000 spent sampling, and reconciliation across 505,493 coldkeys has never been sized.
 
 ## Setup
 
@@ -97,8 +97,11 @@ interactively.
 pnpm chain:backfill    # genesis (or FROM_BLOCK) -> chain head (or TO_BLOCK), chunked + resumable
 ```
 
-**Done 2026-09-06: blocks 1–8,929,643 are in bronze**, 569,181 RPC calls in total, run across
-several sessions off the checkpoint below. Decoded to silver 2026-09-08 — 102,358,339 transfers
+**Done 2026-09-06: blocks 1–8,929,643 are in bronze**, run across many sessions off the checkpoint
+below at a measured 3.0 calls/block, so **~26.8M RPC calls in total**. (Careful reading the logs:
+the script's call counter resets on every process start, so `backfill.log`'s closing "569,181 RPC
+calls" is just the final session — that one covered blocks 8,740,001–8,929,643. Multiply blocks by
+3 for the real figure, not the log line.) Decoded to silver 2026-09-08 — 102,358,339 transfers
 (after removing the 1,447 duplicates described below), 235,553,651 balance events, 3,306,536 stake
 events. Two blocks failed to decode and were skipped
 (logged to `data/meta/materialize_silver_skipped_blocks.jsonl`); that path is deliberate, see
@@ -136,9 +139,13 @@ from ~30 to ~80 (higher concurrency past that point doesn't help).
   100,000-block chunks will be larger still). Fixed by widening the cleanup `finally`.
 
 **Still open, independent of the backfill itself:** read the actual RU cost off the Blockmachine
-dashboard (~192,000 RPC calls sampling, plus the backfill's own 569,181) to confirm the ~13.5–27M
-RU projection fits Pro's 20M/month quota — see plan §4.2 and §6. The monthly budget ran out once
-already, on 2026-09-05, which is what blocked reconciliation then.
+dashboard to confirm the ~13.5–27M RU projection — see plan §4.2 and §6. The budget running out
+on 2026-09-05 is itself a measurement, and the plan's own worry looks confirmed: it was exhausted
+at block 6,440,000, i.e. ~19.3M backfill calls plus ~192,000 sampling ≈ **19.5M calls against
+Pro's 20M RU quota, so roughly 1 RU per call**. At 3 calls/block that puts the full backfill near
+**~26.8M RU**, over Pro's monthly quota — exactly the overshoot §4.2 flagged when the design went
+from 2 to 3 calls per block. Steady state is not a concern by the same arithmetic: 7,200
+blocks/day × 3 ≈ 650K RU/month, well inside Standard.
 
 **If the backfill stops for any reason** (crash, closed terminal, computer restart): rerun the
 exact same command with the same `FROM_BLOCK` and `TO_BLOCK` left unset. It reads
@@ -268,7 +275,8 @@ purely via `.env` — DuckDB `COPY` writes identically either way, no code chang
    endpoint at all.
 2. **Blockmachine** — Pro plan is now active; `BLOCKMACHINE_API_KEY` is set and `pnpm spike-g` has
    been run — see plan §4.2 for the three gate answers. The full genesis backfill is done
-   (2026-09-06, 569,181 RPC calls). The monthly RU budget has run out once already (2026-09-05);
+   (2026-09-06, ~26.8M RPC calls at 3 per block). The monthly RU budget ran out once already
+   (2026-09-05, implying ~1 RU/call — see above);
    check it before the next RPC-bound job, since everything still blocking Phase 3 —
    reconciliation, the genesis-baseline reads, and the hotkey→coldkey map wallet-count series 2
    needs — is RPC-bound.
