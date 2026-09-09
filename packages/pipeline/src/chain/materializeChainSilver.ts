@@ -198,6 +198,27 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
         const resumeFrom = checkpoint ? checkpoint.lastCompletedBatchEnd + 1 : minBlock;
         let batchesSinceFlush = 0;
 
+        // Makes resuming idempotent. A batch inserts transfers, then
+        // balance_events, then stake_events, and only then advances the
+        // checkpoint — so a process that dies mid-batch leaves rows committed
+        // for blocks the checkpoint doesn't know about, and the rerun inserts
+        // them a second time. Found for real (2026-09-09, in already-built
+        // silver): exactly one batch, blocks 5,425,008-5,427,996, had 1,447
+        // duplicated (block_number, event_index) transfer rows while its
+        // balance_events were clean — the signature of a kill landing between
+        // those two inserts. Duplicates don't just add rows: a repeated
+        // transfer permanently shifts that coldkey's running balance for the
+        // rest of history, and it makes account_balances_daily's
+        // last-row-per-day pick ambiguous (tied ORDER BY keys), so the same
+        // input could produce different output run to run. Anything at or
+        // past the resume point can only be such a partial batch, so clear it
+        // before redoing that batch.
+        if (resumable) {
+          for (const table of ["transfers", "balance_events", "stake_events"]) {
+            await connection.run(`DELETE FROM ${table} WHERE block_number >= ${resumeFrom};`);
+          }
+        }
+
         for (let batchStart = resumeFrom; batchStart <= maxBlock; batchStart += batchBlocks) {
           const batchEnd = Math.min(batchStart + batchBlocks - 1, maxBlock);
 

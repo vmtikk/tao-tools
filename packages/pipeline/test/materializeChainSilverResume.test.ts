@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { writeChainEventsBronze, writeChainMetadataBronze } from "@tao-tools/ingest";
 import { materializeChainSilver } from "../src/chain/materializeChainSilver.js";
-import { readMaterializeSilverCheckpoint } from "../src/chain/materializeSilverCheckpoint.js";
+import {
+  readMaterializeSilverCheckpoint,
+  writeMaterializeSilverCheckpoint,
+} from "../src/chain/materializeSilverCheckpoint.js";
 import { metaDir } from "../src/paths.js";
 
 const metadataFixture = JSON.parse(
@@ -163,6 +166,46 @@ describe("materializeChainSilver (resumable)", () => {
 
     // Block 90's real stake event only shows up if it actually got
     // redecoded — a silent skip-ahead would report 0, not 1.
+    expect(second.stakeEventsRowCount).toBe(1);
+  });
+
+  it("does not duplicate rows when a batch's inserts landed but its checkpoint never did", async () => {
+    // Found for real 2026-09-09, in already-materialized silver: blocks
+    // 5,425,008-5,427,996 held 1,447 duplicated (block_number, event_index)
+    // transfer rows while that same batch's balance_events were clean — the
+    // signature of a kill between the transfers insert and the balance_events
+    // insert, since the checkpoint only advances after all three. The rerun
+    // then redid the batch on top of rows that were already committed.
+    // Duplicates are worse than they look: a repeated transfer permanently
+    // shifts that coldkey's running balance for the rest of history, and it
+    // leaves account_balances_daily's last-row-of-day pick ambiguous (tied
+    // ORDER BY keys), so identical input can yield different output run to run.
+    await writeChainMetadataBronze({ specVersion: 101, metadataHex: metadataFixture.metadataHex, capturedAtBlock: 1 });
+    const records = Array.from({ length: 100 }, (_, i) => {
+      const blockNumber = i + 1;
+      if (blockNumber === stakeFixture.block90StakeAdded.blockNumber) {
+        return {
+          blockNumber,
+          blockHash: stakeFixture.block90StakeAdded.blockHash,
+          eventsHex: stakeFixture.block90StakeAdded.eventsHex,
+          timestampHex: stakeFixture.block90StakeAdded.timestampHex,
+        };
+      }
+      return emptyRecord(blockNumber);
+    });
+    await writeChainEventsBronze({ records, fromBlock: 1, toBlock: 100, specVersion: 101 });
+
+    const first = await materializeChainSilver({ resumable: true, batchBlocks: 50 });
+    expect(first.stakeEventsRowCount).toBe(1);
+
+    // Rewinding the checkpoint reproduces the exact post-kill state: blocks
+    // 51-100 are committed in the staging DB, but the checkpoint still says
+    // only 1-50 are done, so the next run redecodes 51-100 over the top.
+    writeMaterializeSilverCheckpoint({ fromBlock: 1, lastCompletedBatchEnd: 50, updatedAtMs: Date.now() });
+
+    const second = await materializeChainSilver({ resumable: true, batchBlocks: 50 });
+
+    // Block 90's stake event must still be there exactly once, not twice.
     expect(second.stakeEventsRowCount).toBe(1);
   });
 

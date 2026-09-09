@@ -17,6 +17,23 @@ const BATCH_BLOCKS = process.env.MATERIALIZE_SILVER_BATCH_BLOCKS
   : 3_000;
 
 /**
+ * Found for real (2026-09-08): the periodic full-table re-export to
+ * silver/*.parquet (COPY of the *entire* accumulated table, not just new
+ * rows) gets more expensive every time it runs, since the tables it's
+ * copying only ever grow — 327s -> 817s and climbing over one run. Nothing
+ * reads silver/*.parquet while this script is running, and a final flush
+ * always happens unconditionally once the whole range completes (see
+ * flushToParquet's call site after the batch loop), so there's no
+ * correctness reason to flush this often mid-run. Raised well above the
+ * default so it effectively only flushes at the end for a normal run;
+ * still overridable if a very long run needs an intermediate flush for
+ * some other consumer.
+ */
+const PARQUET_FLUSH_INTERVAL_BATCHES = process.env.MATERIALIZE_SILVER_FLUSH_INTERVAL_BATCHES
+  ? Number(process.env.MATERIALIZE_SILVER_FLUSH_INTERVAL_BATCHES)
+  : 500;
+
+/**
  * Found for real (2026-08-30): an ~8.9M-block run against R2 over many
  * hours hit a transient DNS resolution failure reaching Cloudflare
  * ("Could not resolve hostname") — nothing wrong with the run itself, just
@@ -44,6 +61,7 @@ async function main(): Promise<void> {
       const result = await materializeChainSilver({
         resumable: true,
         batchBlocks: BATCH_BLOCKS,
+        parquetFlushIntervalBatches: PARQUET_FLUSH_INTERVAL_BATCHES,
         onProgress: ({ batchStart, batchEnd, minBlock, maxBlock, elapsedMs }) => {
           const doneBlocks = batchEnd - minBlock + 1;
           const totalBlocks = maxBlock - minBlock + 1;
