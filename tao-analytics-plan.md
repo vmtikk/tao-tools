@@ -291,6 +291,21 @@ re-parseable.
   measured per-block cost before committing to the backfill. If it lands above 20M, either accept
   Standard-tier overage for that month or drop the timestamp call and backfill it separately later
   (against the "no second backfill" argument above, but possibly still cheaper than the overage).
+
+  **Measured on Pro, after the fact (2026-09-09) — the pre-flight measurement above never happened;
+  the backfill was run without it, and the warning turned out to be right.** Call volume is exact:
+  the final backfill session did 569,181 calls over blocks 8,740,001–8,929,643, i.e. **3.0
+  calls/block**, so the full range cost **~26.8M calls**. (Do not read a total off `backfill.log` —
+  the script's counter resets on every process start, so its closing line is one session, not the
+  run.) RU-per-call was never read off the dashboard, but the budget exhaustion dates it: the quota
+  ran out on 2026-09-05 at block 6,440,000, i.e. ~19.3M backfill calls plus the ~192,000 spent
+  sampling ≈ **19.5M calls against Pro's 20M RU quota — so ≈1 RU per call**. That puts the full
+  backfill at **~26.8M RU**, over Pro's monthly quota, exactly the overshoot flagged above when the
+  design went from 2 to 3 calls per block. It is why the run spanned more than one budget period.
+  Steady state is unaffected and needs no re-measuring: 7,200 blocks/day × 3 ≈ **650K RU/month**,
+  consistent with the ~645K projected below. Still worth confirming ≈1 RU/call against the actual
+  dashboard before sizing reconciliation, since that conversion is now load-bearing for the only
+  remaining budget decision (§6, closeout item 3).
 - Steady state: **Standard, $9/mo** — head-of-chain indexing is ~430k RU/month, 10x headroom. Also
   based on the 2-call design; head-of-chain indexing is one block at a time regardless, so the +50%
   here is small in absolute terms (~645k RU/month) and Standard's headroom easily absorbs it — this
@@ -576,42 +591,50 @@ full account — three attempts against the real backfilled prefix all failed be
 verdict: a real memory bug in `loadEventsFromSilver` unrelated to `UP_TO_BLOCK`, then RPC rate-limit
 contention with the concurrently-running `chain:backfill`, then the account's monthly RU budget
 running out entirely). The memory bug is fixed and tested; the run itself still needs to happen once
-RUs are available again. Also not yet built: persisting each checkpoint's raw `System.Account` reads
+RUs are available again. Two of those three blockers are now gone — the backfill finished on
+2026-09-06 so nothing competes for rate limit any more, and silver covers the full range, so
+`UP_TO_BLOCK=8929643`. What remains is budget, and sizing the run before spending it (item 3 below). Also not yet built: persisting each checkpoint's raw `System.Account` reads
 to `chain/checkpoints/{date}.parquet` per §2's bronze layout (currently the checkpoint reads happen
 but aren't archived to bronze) — deferred, not required to validate the fold's correctness, only to
 avoid re-fetching the same ground-truth reads if reconciliation is rerun.
 
-**Done when:** the partial event index is in bronze, reconciles against monthly checkpoints, and
-every row's `spec_version` reflects the runtime actually active at that block. (Relaxed from "full"
-to "partial" 2026-08-26 — the full genesis-to-head backfill takes ~2.7-3 days and runs
-independently in the background; 2.3's tooling and correctness can be, and are, fully validated
-against whatever prefix is complete so far, same reasoning as the reconciliation-checkpoint design
-below. Re-run `chain:reconcile-checkpoints` with a larger `UP_TO_BLOCK` as the backfill progresses;
-nothing here needs to wait for 100%.)
+**Done when:** the event index is in bronze, reconciles against monthly checkpoints, and every row's
+`spec_version` reflects the runtime actually active at that block. (This was relaxed from "full" to
+"partial" on 2026-08-26 to avoid blocking on a multi-day background job; the full index landed
+2026-09-06 anyway, so the relaxation no longer matters — only the "reconciles against monthly
+checkpoints" clause is still outstanding.)
 
 **Before trusting Phase 3's numbers, close out what 2.3 left open** (added 2026-08-27; status as of
-2026-09-05, the next session's actual starting point):
+2026-09-09, the next session's actual starting point):
 
-1. ✅ Ongoing — check `data/meta/chain_backfill_checkpoint.json`'s `lastCompletedBlock` for how far
-   `chain:backfill` has actually gotten (gitignored, local-only state). As of 2026-09-05 ~18:30:
-   6,440,000 / 8,929,643 (72.1%). **Currently paused** — this month's RU budget ran out; resume by
-   running the script in `notes.txt` in your own terminal (never through the agent — it must survive
-   independent of the Claude Code session) once budget is available.
-2. ✅ Done, but behind bronze — `chain:materialize-silver` has decoded up to block 5,872,000, ~570K
-   blocks behind what `chain:backfill` already fetched (6,440,000). Decoding bronze→silver is pure
-   local DuckDB work, no RPC/RUs involved, so it's safe and free to resume any time — the only
-   constraint is it needs a terminal that outlives the Claude Code session, same as backfill.
-3. ❌ **Still the actual blocker** — run `chain:reconcile-checkpoints` with `UP_TO_BLOCK` set to
-   whatever block `chain:materialize-silver` covers once it's caught back up, per §6's guidance above.
-   Three real-data attempts on 2026-09-05 all failed before reaching a verdict (see §6 and Phase 3.1's
-   entries below) — this still has never actually completed against real (non-fixture) chain data,
-   only against `fixtures/chain/`. Needs RU budget. Confirm it comes back clean before trusting the
-   index.
-4. Phase 3's `account_balances_daily` (3.1) and the two wallet-count series were already built and run
-   against the real 5.83M-block prefix ahead of step 3 passing, deliberately, to validate the pipeline
-   plumbing at zero RU cost — **their numbers are provisional** until step 3 actually confirms the
-   fold. Don't build further Phase 3 work (3.2 exchange labels are RPC-free and fine to continue;
-   3.3 needs 3.1's numbers to be trustworthy) past what step 3 has reconciled.
+1. ✅ **Done 2026-09-06** — `chain:backfill` reached the head it pinned at first run:
+   `data/meta/chain_backfill_checkpoint.json` reads `lastCompletedBlock: 8929643` of 8,929,643.
+   Cost ~26.8M RPC calls at a measured 3.0 calls/block; see §4.2's "Measured on Pro" note for what
+   that implies about RU pricing and why it outran a monthly quota partway.
+2. ✅ **Done 2026-09-08** — `chain:materialize-silver` has decoded the whole range: 102,358,339
+   transfers, 235,553,651 balance events, 3,306,536 stake events, with 2 blocks skipped on decode
+   failure (logged to `data/meta/materialize_silver_skipped_blocks.jsonl`). Two things were found
+   and fixed getting there, both worth knowing before the next long local run — see the README's
+   "Decoding bronze -> silver at full scale": the resume path was **not idempotent** and had
+   silently duplicated one batch into silver (1,447 duplicate transfer rows in blocks
+   5,425,008–5,427,996, since repaired), and a hard power-off can leave the JSON checkpoint
+   NUL-filled while the staging DB stays intact, which is recoverable.
+3. ❌ **Still the actual blocker, and now the only one** — run `chain:reconcile-checkpoints` with
+   `UP_TO_BLOCK=8929643` (silver now covers the full range, so the old "once it's caught back up"
+   caveat is gone). Three real-data attempts on 2026-09-05 all failed before reaching a verdict (see
+   Phase 3.1's entries below); this has still never completed against real (non-fixture) chain data.
+   Needs RU budget. **Size it before spending any**: it re-verifies every earlier window on each
+   invocation, ~41 windows against 505,493 distinct coldkeys, and has never been run at that scale.
+   `packages/pipeline/src/scripts/estimateReconciliationRpc.ts` estimates the call count locally
+   with no RPC; at ~1 RU/call (§4.2) that converts straight to budget.
+4. Phase 3's `account_balances_daily` (3.1) and the two wallet-count series have now been built and
+   run against the **complete** index, but still ahead of step 3 passing — **their numbers remain
+   provisional** until reconciliation actually confirms the fold. There is now hard evidence that
+   caveat is load-bearing rather than ceremonial: `account_balances_daily` contains 116,930
+   negative-balance rows across 10,620 distinct coldkeys (~2% of 505,493), which is impossible for a
+   real on-chain balance — see 3.3 below and §10's genesis-funded-accounts trap. Don't build further
+   Phase 3 work (3.2 exchange labels are RPC-free and fine to continue; 3.3 needs 3.1's numbers to be
+   trustworthy) until step 3 comes back clean.
 
 ### Phase 3 — Chain metrics (chart 4, plus exchanges)
 
@@ -621,16 +644,15 @@ nothing here needs to wait for 100%.)
 | 3.2 | Exchange label set (§7.2) — manual research, can start any time from Phase 1 onward |
 | 3.3 | Exchange balances chart, falls out of 3.1 + 3.2 at zero marginal cost |
 
-**3.1 in progress, 2026-09-05 — plumbing built and run against the real ~5.8M-block prefix, but
-provisional: `chain:reconcile-checkpoints` has still never completed successfully against real
-chain data** (RPC rate-limit contention with the concurrent `chain:backfill` run blocked two attempts
-same-day, then the account's monthly RU budget ran out entirely, blocking RPC-dependent work — both
-backfill and reconciliation — until next month's budget or more RUs are purchased). `account_balances_daily`
-and the two wallet-count series below were built and materialized anyway, deliberately ahead of
-reconciliation passing, to validate the SQL/registry pipeline itself at zero RU cost per the user's
-call — **their numbers are not yet verified against on-chain ground truth** and must not be treated as
-final until a `chain:reconcile-checkpoints` run against this prefix comes back clean (§6 above still
-governs: don't build past the reconciled prefix once reconciliation actually runs).
+**3.1 built against the complete index as of 2026-09-09, and still provisional:
+`chain:reconcile-checkpoints` has never completed successfully against real chain data.** The
+original 2026-09-05 blockers were RPC rate-limit contention with the then-concurrent
+`chain:backfill`, and then the monthly RU budget running out entirely; the first is gone (backfill
+finished 2026-09-06) and the second is the remaining one. `account_balances_daily` and the two
+wallet-count series below were built and materialized ahead of reconciliation passing, deliberately,
+to validate the SQL/registry pipeline at zero RU cost — **their numbers are not verified against
+on-chain ground truth** and must not be treated as final until a `chain:reconcile-checkpoints` run
+comes back clean. 3.3 below quantifies exactly how unverified they are.
 
 - Added to `data/meta/metrics_registry.yaml`: `account_balances_daily` (internal, `export: false` —
   sparse per-coldkey, per-day-with-activity free balance, folding signed deltas from
@@ -644,10 +666,24 @@ governs: don't build past the reconciled prefix once reconciliation actually run
 - **Series 2 (stake > 0) is not built** — §4.2's known gap still stands: stake events are keyed by
   hotkey, not coldkey, and turning that into "coldkeys with stake > 0" needs a hotkey→coldkey mapping
   via the `Owner` storage item. That's an RPC job, so it's blocked on RU budget same as reconciliation.
-- Real output (2026-09-05, prefix ending ~block 5.83M / June 2025): wallet count grows from 8 coldkeys
-  at genesis (March 2023) to 179,290 (free balance > 0) / 55,745 (dust-filtered, > 0.01 TAO) — a
-  coherent, monotonically-growing adoption curve, which is a good sign the fold logic is doing
-  something sane even before reconciliation formally confirms it.
+- Real output (2026-09-09, complete index through block 8,929,643): wallet count grows from 8
+  coldkeys at genesis (March 2023) to **373,113** (free balance > 0) / **94,392** (dust-filtered,
+  > 0.01 TAO), over 1,256 daily points. `account_balances_daily` itself is 4,161,851 rows across
+  505,493 distinct coldkeys. Still a coherent, monotonically-growing adoption curve, which is a good
+  sign the fold logic is doing something sane even before reconciliation formally confirms it.
+  (Superseded numbers, for continuity with older notes: the 2026-09-05 run against the ~5.83M-block
+  prefix gave 179,290 / 55,745.)
+- **`account_balances_daily` was rewritten to v2 on 2026-09-09** — see the registry changelog for
+  the full argument. It aggregates deltas per (coldkey, day) *before* the running sum rather than
+  running-summing every event and keeping each day's last row. Same definition, two reasons: v1 tied
+  its last-row-of-day pick whenever a coldkey's day ended in a self-transfer (a transfer's two legs
+  share one `(block_number, event_index)`), returning a balance off by the transfer amount
+  non-deterministically; and v1 could not complete at full scale at all — it sorted ~440M delta rows,
+  ran 2h48m and then 4h+ without finishing, and twice exhausted the temp directory. v2 runs in ~7min.
+  The registry also gained `shard_by`, which computes a metric one hash-bucket of a column at a time
+  with a checkpoint per bucket (progress, bounded memory, resumable) — necessary but *not*
+  sufficient here, because hash buckets balance keys and not rows and one pallet-derived account
+  holds ~44% of all transfer legs in a single unsplittable partition.
 - Bug fixed in the same pass, worth remembering for the next registry entry that touches chain
   silver: `materializeGold` only created a `silver_transfers` view when `transfers.parquet` existed,
   with no equivalent fallback for `silver_balance_events` — any entry referencing it (this was the
@@ -673,6 +709,16 @@ one. The real fix is the same one reconciliation already needs: a real on-chain 
 coldkey touched before its first fold event, which needs RPC (blocked on RU budget same as
 everything else in §6). Left as further concrete evidence for the "provisional" caveat — first thing
 to check once `chain:reconcile-checkpoints` finally runs.
+
+**Re-measured 2026-09-09 against the complete index, and it is not a March-2023 curiosity.** The
+same -9,154.6 TAO floor is still there (10 negative days on `exchange_balances_daily`), but the
+underlying gap is far wider than the one MEXC coldkey: `account_balances_daily` now has **116,930
+rows with a negative balance, across 10,620 distinct coldkeys** — about 2% of all 505,493 coldkeys
+in the fold. Every one of those is an account that spent TAO the event fold never saw it receive.
+This is the single best argument for treating Phase 3's numbers as provisional: it is a *lower*
+bound on the damage, since a genesis-funded coldkey that never spends below its invisible starting
+balance stays quietly positive and wrong rather than visibly negative. Sizing the fix is part of
+sizing reconciliation — both need the same per-coldkey `System.Account` reads.
 
 ### Phase 4 — Supply in profit (chart 5)
 
