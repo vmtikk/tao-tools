@@ -4,12 +4,23 @@ TAO analytics pipeline. See [tao-analytics-plan.md](tao-analytics-plan.md) for t
 
 **Status: Phase 1 (prices and volume — charts 1–3) implemented; Phase 2.1/2.2 (chain tracer
 bullet + balance reconciliation) implemented, bronze now writes to real Cloudflare R2. Phase 2.3's
-tooling (runtime-upgrade detection, resumable/checkpointed backfill, incremental reconciliation
-checkpoints) is implemented, and the full 8.9M-block genesis backfill is running (started
-2026-08-26, user-run, ~2.7-3 day estimate).** Every venue is fetched through `ccxt` (§2 stack),
-including Kraken — the Phase 0 hand-rolled Kraken REST client was migrated in Phase 1.
-Blockmachine Pro is active. RU cost still needs a Blockmachine-dashboard check against the
-~192,000 RPC calls spent sampling throughput (§4.2) — not yet confirmed to fit Pro's 20M/month quota.
+backfill is complete — the full genesis-to-head event index (blocks 1–8,929,643) landed in bronze
+2026-09-06, was decoded to silver 2026-09-08, and gold/export were rebuilt across the whole range
+2026-09-09.** Every venue is fetched through `ccxt` (§2 stack), including Kraken — the Phase 0
+hand-rolled Kraken REST client was migrated in Phase 1. Blockmachine Pro is active.
+
+**Phase 3's numbers are still provisional, and this is the one thing blocking the project.**
+`chain:reconcile-checkpoints` has never completed against real chain data — only against fixtures
+— so nothing in the fold has been checked against on-chain ground truth. There is now concrete
+evidence it needs to: on the full index, `account_balances_daily` has **116,930 rows with a
+negative balance across 10,620 distinct coldkeys** (~2% of all 505,493), and
+`exchange_balances_daily` still bottoms out at **−9,154.6 TAO**. A negative on-chain balance is
+impossible; these are the genesis-funded accounts of plan §10 (funded directly in genesis state,
+so no `Deposit` event ever fires and the fold starts them at zero). Fixing it needs real
+`System.Account` reads — i.e. the same RPC work reconciliation needs. Don't treat wallet counts or
+exchange balances as final until that run comes back clean. RU cost also still needs a
+Blockmachine-dashboard check (§4.2) — the backfill alone spent 569,181 RPC calls on top of the
+~192,000 spent sampling, and reconciliation across 505,493 coldkeys has never been sized.
 
 ## Setup
 
@@ -36,7 +47,11 @@ pnpm web:dev                     # http://localhost:3000 — renders all three c
 `ingest:backfill-prices` is a real, potentially long-running pull against seven exchanges — it
 has not been run against live APIs yet (only unit/contract-tested against fixtures and injected
 fetchers). Run it manually when ready; it's resumable in the sense that re-running it just
-re-fetches and dedupes in silver, so a partial/interrupted run is not destructive.
+re-fetches and dedupes in silver, so a partial/interrupted run is not destructive. **This is why
+the price charts are near-empty** while the chain charts span the full history: the current
+`gold.json` carries 587 points for `price_composite_usd` and none at all for `price_composite_btc`,
+because silver only holds whatever thin OHLCV has been pulled so far. Unrelated to any of the chain
+work — it's a Phase 1 gap.
 
 `pnpm test` runs the full suite (unit, query, contract, golden-file — see plan §5).
 
@@ -45,7 +60,7 @@ re-fetches and dedupes in silver, so a partial/interrupted run is not destructiv
 ```
 pnpm chain:ingest                    # blocks 1-1000 (default): raw System.Events + Timestamp.Now -> R2 bronze
 pnpm chain:materialize-silver        # bronze chain/* -> silver/transfers.parquet + balance_events.parquet
-pnpm pipeline:materialize            # (as above) now also produces gold/transfer_count_per_block.parquet
+pnpm pipeline:materialize            # (as above) now also produces gold/transfer_count_daily.parquet
 pnpm pipeline:export
 pnpm chain:reconcile-balances        # folds silver into a BalanceMap, checks it against real System.Account reads
 ```
@@ -59,8 +74,9 @@ for any range, not just one starting at genesis — see the "genesis-funded acco
 - 1,000/1,000 blocks had non-empty `System.Events`, but only 2 `Balances.Transfer` and 59
   `Balances.Deposit`/`Withdraw` events in total — most activity is `System`, `SubtensorModule`
   (`AxonServed`, `WeightsSet`), and `TransactionPayment` (fees were 0 in this window, so no balance
-  moved from those). `transfer_count_per_block` is a near-empty series (2 points) — correct, not a
-  bug; this window mostly proves the decode path, not real transfer volume.
+  moved from those). `transfer_count_daily` (per-block at the time, since renamed and rebucketed —
+  see plan §6) was a near-empty series (2 points) — correct, not a bug; this window mostly proves
+  the decode path, not real transfer volume.
 - **`chain:reconcile-balances` found a real gap on the first run**, not a clean pass: several
   coldkeys already held tens of thousands of TAO *at block 0*, before any event fires for it
   (genesis state is constructed directly, not via extrinsics — see the new trap in plan §10). The
@@ -75,11 +91,19 @@ for any range, not just one starting at genesis — see the "genesis-funded acco
 — 1,000 blocks takes roughly 75 minutes. It's meant to run as a background process, not
 interactively.
 
-### Phase 2.3 — full event index backfill (tooling implemented, not yet run)
+### Phase 2.3 — full event index backfill (complete)
 
 ```
 pnpm chain:backfill    # genesis (or FROM_BLOCK) -> chain head (or TO_BLOCK), chunked + resumable
 ```
+
+**Done 2026-09-06: blocks 1–8,929,643 are in bronze**, 569,181 RPC calls in total, run across
+several sessions off the checkpoint below. Decoded to silver 2026-09-08 — 102,358,339 transfers
+(after removing the 1,447 duplicates described below), 235,553,651 balance events, 3,306,536 stake
+events. Two blocks failed to decode and were skipped
+(logged to `data/meta/materialize_silver_skipped_blocks.jsonl`); that path is deliberate, see
+`materializeChainSilver`'s catch — a single block's SCALE bytes failing to decode must not halt
+the other 8.9M.
 
 Env vars: `FROM_BLOCK` (default 1), `TO_BLOCK` (default: live chain head), `CHAIN_CHUNK_BLOCKS`
 (default 100,000 — one bronze file per chunk, split further only at a runtime-upgrade boundary),
@@ -112,14 +136,45 @@ from ~30 to ~80 (higher concurrency past that point doesn't help).
   100,000-block chunks will be larger still). Fixed by widening the cleanup `finally`.
 
 **Still open, independent of the backfill itself:** read the actual RU cost off the Blockmachine
-dashboard (~192,000 combined RPC calls spent sampling so far) to confirm the ~13.5–27M RU
-projection fits Pro's 20M/month quota — see plan §4.2 and §6.
+dashboard (~192,000 RPC calls sampling, plus the backfill's own 569,181) to confirm the ~13.5–27M
+RU projection fits Pro's 20M/month quota — see plan §4.2 and §6. The monthly budget ran out once
+already, on 2026-09-05, which is what blocked reconciliation then.
 
 **If the backfill stops for any reason** (crash, closed terminal, computer restart): rerun the
 exact same command with the same `FROM_BLOCK` and `TO_BLOCK` left unset. It reads
 `data/meta/chain_backfill_checkpoint.json` and resumes from the next block after
 `lastCompletedBlock` — `TO_BLOCK` is resolved once (the live head at first run) and pinned in the
 checkpoint from then on, so a restart won't recompute a different head and fail to match it.
+
+### Decoding bronze -> silver at full scale
+
+`chain:materialize-silver` is pure local DuckDB/CPU work — no RPC, no RUs — but it is hours of it
+against the full range, so it's resumable: a persistent staging DB in `data/silver/` plus a JSON
+checkpoint in `data/meta/`. Stop it and rerun the same command to continue. `MATERIALIZE_SILVER_BATCH_BLOCKS`
+(default 3,000) and `MATERIALIZE_SILVER_FLUSH_INTERVAL_BATCHES` (default 500) tune it.
+
+Three things learned running it end to end (2026-09-07/08), all fixed, all worth knowing before
+the next long run:
+
+- **The resume used to be non-idempotent, and it silently corrupted silver.** A batch inserts
+  transfers, then balance_events, then stake_events, and only *then* advances the checkpoint — so a
+  process killed between the first two inserts left transfer rows committed for blocks the
+  checkpoint didn't know about, and the rerun inserted them again. Found for real: 1,447 duplicated
+  `(block_number, event_index)` transfer rows in blocks 5,425,008–5,427,996, with that batch's
+  balance_events clean. Duplicates aren't just extra rows — a repeated transfer permanently shifts
+  that coldkey's running balance for the rest of history. Resuming now deletes anything at or past
+  the resume point first. If you suspect an older silver build, check with
+  `SELECT block_number, event_index, COUNT(*) FROM read_parquet('data/silver/transfers.parquet') GROUP BY 1,2 HAVING COUNT(*) > 1`,
+  and repair inside the **staging DB**, not just the parquet — silver/*.parquet is re-exported from
+  it on every run, so fixing only the parquet puts the duplicates straight back.
+- **The periodic parquet flush re-exported the whole table, not just new rows**, so it got steadily
+  more expensive: 327s -> 817s per flush, with per-batch time drifting 150s -> 680s across one run.
+  Raising the interval took the tail of the run from ~5 blocks/s back to ~37 blocks/s.
+- **A hard power-off can leave the JSON checkpoint the right length but full of NUL bytes** (the
+  rename lands, the written bytes never flush). The staging DB survives that — it's transactional —
+  so the recovery is to read the real progress out of it
+  (`SELECT MAX(block_number) FROM transfers`, which lands on a batch boundary) and rewrite the
+  checkpoint to match, rather than redecoding from scratch.
 
 ### Phase 2.3 — reconciliation checkpoints
 
@@ -142,9 +197,43 @@ which only happened to be correct because it had only ever been called with `fro
 (Phase 2.2) — any later, non-genesis checkpoint would have double-counted every event before its
 window. Events are now filtered to the requested `[fromBlock, toBlock]` before folding.
 
-Not yet run against the real in-progress backfill (needs `chain:materialize-silver` run first);
-validated with fixture-backed tests (`packages/pipeline/test/reconcileBalances.test.ts`,
+**Still never run against real chain data — this is the project's blocker.** Only validated with
+fixture-backed tests (`packages/pipeline/test/reconcileBalances.test.ts`,
 `runReconciliationCheckpoints.test.ts`) using the recorded real metadata in `fixtures/chain/`.
+The prerequisite is now met: silver covers the whole range, so `UP_TO_BLOCK=8929643` is correct.
+What's left is RPC budget and an honest estimate of the call count — this walks ~41 windows of
+216,000 blocks and re-verifies every earlier window on each invocation, against 505,493 distinct
+coldkeys, and has never been sized at that scale. Estimate the reads before spending budget.
+
+### Sharded gold metrics (`shard_by`)
+
+A registry entry may set `shard_by: <output column>`. The runner then computes that metric one
+hash-bucket of the column at a time — narrowing the silver views to the bucket, running the
+entry's SQL *verbatim*, keeping only that bucket's output rows, and writing one part file per
+bucket before concatenating them. `GOLD_SHARD_COUNT` (default 64) sets the bucket count.
+
+This is only valid when every window/group in the entry's SQL partitions by that column, so a
+bucket's rows are computable without seeing any other bucket's — set it anywhere else and the
+output is silently wrong, not just slow. `account_balances_daily` qualifies; nothing else currently
+does.
+
+What it buys, and why it exists: the metric used to run as one statement over ~440M delta rows and
+could not finish against the full index — 2h48m and then 4h+ without completing, ~186GB of spill,
+and two outright temp-directory exhaustions, all while reporting nothing (DuckDB's query-progress
+API returns no estimate for that query shape). Sharding gives bounded memory, an honest
+`shard 12/64 complete (18.8%), 4m12s elapsed, ~14m remaining` line, and a checkpoint per bucket so
+a shutdown costs one bucket rather than the whole run. Progress lives in
+`data/meta/gold_shard_checkpoint_<metric>.json` and parts in `data/gold/<metric>.parts/`; both are
+cleared once the metric assembles. A checkpoint is only reused when a fingerprint over the metric's
+SQL *and* the silver files it actually reads still matches, and only for buckets whose part file is
+genuinely on disk.
+
+Note that sharding alone was not what made this tractable — it isolated the problem but couldn't
+solve it, because hash bucketing balances *keys*, not *rows*, and one pallet-derived account holds
+~44% of all transfer legs (~91M rows) in a single unsplittable partition. That bucket still ran 4+
+hours. What fixed it was `account_balances_daily` v2 (aggregate per (coldkey, day) *before* the
+running sum, see the registry changelog), which collapses that account to ~91 daily rows. Full run
+is now 7m11s.
 
 ### Venues (Phase 1, §4.1)
 
@@ -178,12 +267,79 @@ purely via `.env` — DuckDB `COPY` writes identically either way, no code chang
    Storage", is a different credential system and won't authenticate against the S3-compatible
    endpoint at all.
 2. **Blockmachine** — Pro plan is now active; `BLOCKMACHINE_API_KEY` is set and `pnpm spike-g` has
-   been run — see plan §4.2 for the three gate answers. Phase 2.3's backfill tooling is implemented
-   (`pnpm chain:backfill`, see above), but the full genesis backfill hasn't been run — re-measure
-   RU cost on Pro first (§4.2, §6).
+   been run — see plan §4.2 for the three gate answers. The full genesis backfill is done
+   (2026-09-06, 569,181 RPC calls). The monthly RU budget has run out once already (2026-09-05);
+   check it before the next RPC-bound job, since everything still blocking Phase 3 —
+   reconciliation, the genesis-baseline reads, and the hotkey→coldkey map wallet-count series 2
+   needs — is RPC-bound.
 3. **Vercel**: connect the repo, set the build to `pnpm --filter @tao-tools/web run build`,
    and wire the nightly job (plan §9) to push `data/export/gold.json` and hit the deploy hook.
    Not done yet.
+
+## Continuous bronze sync (Hetzner / any always-on Ubuntu server)
+
+[`sync-bronze.sh`](sync-bronze.sh) is the incremental counterpart to the
+one-shot genesis backfill above, and *only* that — it repeats `chain:backfill`
+with no `TO_BLOCK`, so every run resolves a fresh chain head and catches up
+from wherever the previous run's checkpoint left off. Nothing else: it
+doesn't touch prices, doesn't decode anything, doesn't produce chart data.
+`chain:materialize-silver`/`pipeline:materialize`/`pipeline:export` (bronze
+-> the tables the charts read) are a separate, unrelated step — run those
+wherever/whenever you want fresh charts; they just read the same R2 bucket
+this keeps topped up.
+
+Because of that narrow scope, the server only needs `packages/core` +
+`packages/ingest` — not `packages/pipeline` (ingest never depends on it,
+only the reverse) and not `packages/web`. Code reaches the server via a git
+sparse checkout (against a private GitHub remote — this repo doesn't have
+one yet, push it once: `git remote add origin <url> && git push -u origin
+master`); the small amount of local-only state that isn't in git (secrets,
+the backfill checkpoint) goes over via `deploy/push-state.sh`.
+
+One-time setup, on the server:
+
+```
+git clone --filter=blob:none --no-checkout <your-repo-url> /opt/tao-tools
+cd /opt/tao-tools
+git sparse-checkout init --cone
+git sparse-checkout set packages/core packages/ingest deploy
+git checkout master
+```
+
+Then, from this machine:
+
+```
+deploy/push-state.sh user@your-server:/opt/tao-tools
+```
+
+That pushes `.env` and `data/meta/chain_backfill_checkpoint.json`
+(gitignored, so they only exist here) — without the checkpoint the server
+would start `chain:backfill` over from block 1 instead of resuming. **Never
+run `sync-bronze.sh` on the server at the same time as a manual
+`chain:backfill` here** — both read/write that same checkpoint file.
+
+Back on the server, build and start the timer:
+
+```
+cd /opt/tao-tools
+pnpm install --filter @tao-tools/ingest... && pnpm --filter @tao-tools/ingest... run build
+./sync-bronze.sh   # run once by hand to confirm it works end to end
+sudo cp deploy/tao-sync.service deploy/tao-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tao-sync.timer
+```
+
+Future code changes to `packages/core`/`packages/ingest`: push from here as
+usual (`git push`), then on the server run
+[`deploy/update.sh`](deploy/update.sh) (`git pull` + rebuild, scoped to the
+same two packages).
+
+Follow logs live: `journalctl -u tao-sync -f`. Check schedule/last run:
+`systemctl list-timers tao-sync.timer` / `systemctl status tao-sync.service`.
+`OnUnitActiveSec=15min` in the timer is relative to the previous run
+*finishing*, so a slow catch-up (e.g. after downtime) just delays the next
+run instead of overlapping it; `sync-bronze.sh` also takes its own `flock` in
+case it's ever invoked manually while the timer's run is still going.
 
 ## Repo layout
 
