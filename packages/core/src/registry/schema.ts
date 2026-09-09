@@ -17,6 +17,21 @@ export const MetricEntrySchema = z.object({
    * materialize to gold like any other metric but never ship in gold.json —
    * they aren't one of the charts, just plumbing another metric depends on. */
   export: z.boolean().default(true),
+  /**
+   * Names an output column this metric's SQL partitions by end to end, which
+   * lets gold materialization compute it one hash-bucket of that column at a
+   * time instead of in a single pass over all of chain history. Only valid
+   * when every window/group in the SQL partitions by this column, so that a
+   * bucket's rows are computable without seeing any other bucket's — set it
+   * anywhere else and the output is silently wrong, not just slow.
+   *
+   * Set for account_balances_daily (2026-09-09): its single-pass form sorted
+   * ~440M delta rows at once, which on a 14GB machine meant an external sort
+   * that ran for hours, wrote ~186GB of spill, and twice exhausted the temp
+   * directory outright. Bucketing keeps each pass in memory, makes progress
+   * reportable as buckets-completed, and makes the work resumable.
+   */
+  shard_by: z.string().min(1).optional(),
 });
 
 export type MetricEntry = z.infer<typeof MetricEntrySchema>;

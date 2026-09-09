@@ -111,7 +111,7 @@
     - v1: initial (Phase 2.1)
 
 - name: account_balances_daily
-  version: 1
+  version: 2
   definition: >
     Per-coldkey free balance (rao) at the end of each UTC day, one row per
     (coldkey, day) that had at least one balance-affecting event that day —
@@ -122,12 +122,20 @@
     turned into a continuous daily series without materializing that cross
     product). Folds silver_transfers (signed +/- to the two legs) and
     silver_balance_events (deposit=+, withdraw=-) into one signed delta
-    stream per coldkey, running-sums it in event order (block_number,
-    event_index — never wall-clock), then keeps only the last balance of
-    each UTC day. Internal base table, not a chart — see wallet_count_*.
+    stream per coldkey, sums those deltas per (coldkey, UTC day), then
+    running-sums the daily totals in day order. End-of-day balance is by
+    definition the cumulative sum of every delta up to and including that
+    day, so aggregating per day before the running sum gives the same
+    answer as folding event by event. Internal base table, not a chart —
+    see wallet_count_*.
   params: {}
   depends_on: []
   export: false
+  # Every window below partitions by coldkey, so one coldkey's balance never
+  # depends on another's — the runner computes this a hash-bucket of coldkeys
+  # at a time (bounded memory, real progress, resumable) instead of sorting
+  # all ~440M delta rows in one pass. See MetricEntrySchema's shard_by.
+  shard_by: coldkey
   sql: >
     WITH deltas AS (
       SELECT from_coldkey AS coldkey, block_number, event_index, timestamp_ms, -amount_rao AS delta_rao
@@ -140,28 +148,40 @@
              CASE kind WHEN 'deposit' THEN amount_rao ELSE -amount_rao END AS delta_rao
       FROM silver_balance_events
     ),
-    running AS (
-      SELECT coldkey, block_number, event_index,
+    daily AS (
+      SELECT coldkey,
              (timestamp_ms // 86400000) * 86400000 AS day_ms,
-             SUM(delta_rao) OVER (
-               PARTITION BY coldkey ORDER BY block_number, event_index
-               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-             ) AS balance_rao
+             SUM(delta_rao) AS day_delta_rao
       FROM deltas
-    ),
-    last_per_day AS (
-      SELECT coldkey, day_ms, balance_rao,
-             ROW_NUMBER() OVER (
-               PARTITION BY coldkey, day_ms ORDER BY block_number DESC, event_index DESC
-             ) AS rn
-      FROM running
+      GROUP BY coldkey, day_ms
     )
-    SELECT coldkey, day_ms AS timestamp_ms, balance_rao
-    FROM last_per_day
-    WHERE rn = 1
+    SELECT coldkey, day_ms AS timestamp_ms,
+           SUM(day_delta_rao) OVER (
+             PARTITION BY coldkey ORDER BY day_ms
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           ) AS balance_rao
+    FROM daily
     ORDER BY coldkey, timestamp_ms
   changelog:
     - v1: initial (Phase 3.1)
+    - v2: >
+        Aggregate deltas per (coldkey, day) before the running sum instead of
+        running-summing every event and keeping the last row of each day.
+        Fixes a correctness bug and removes the pipeline's worst bottleneck.
+        Correctness: a transfer contributes two delta rows sharing one
+        (block_number, event_index), so a self-transfer puts both legs in the
+        same coldkey's partition with identical sort keys, and v1's
+        "ROW_NUMBER() ... ORDER BY block_number DESC, event_index DESC" then
+        broke that tie arbitrarily — picking a running sum that had applied
+        one leg but not the other and reporting a balance off by the transfer
+        amount, non-deterministically. Found 2026-09-09 on real data (103
+        self-transfers across 44 coldkeys; one was wrong by exactly 90000000
+        rao). Summing a day's deltas is tie-free. Performance: v1 sorted all
+        ~440M delta rows to compute a per-event running sum it then discarded
+        all but one row per day of. One pallet-derived account holds ~44% of
+        all transfer legs (~91M rows) and cannot be split across shards, so
+        its single partition ran 4+ hours without finishing; under v2 it
+        collapses to ~91 daily rows and completes in ~3s.
 
 - name: wallet_count_free_balance
   version: 1
