@@ -1,3 +1,4 @@
+import { loadEnvFile } from "../env.js";
 import { fetchCcxtOhlcv, normalizeCcxtOhlcv } from "../exchanges/ccxtOhlcv.js";
 import { writeOhlcBronze } from "../bronze/writer.js";
 import { USD_VENUES } from "../exchanges/venues.js";
@@ -10,6 +11,7 @@ import { USD_VENUES } from "../exchanges/venues.js";
  * changed.
  */
 async function main(): Promise<void> {
+  loadEnvFile();
   const venue = USD_VENUES.find((v) => v.exchange === "kraken");
   if (!venue) throw new Error('USD_VENUES has no "kraken" entry');
 

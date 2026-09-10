@@ -1,4 +1,4 @@
-import { createBlockmachineClient } from "@tao-tools/ingest";
+import { createBlockmachineClient, loadEnvFile } from "@tao-tools/ingest";
 import { runReconciliationCheckpoints } from "../chain/runReconciliationCheckpoints.js";
 
 /**
@@ -15,6 +15,7 @@ import { runReconciliationCheckpoints } from "../chain/runReconciliationCheckpoi
  * "just call reconcileBalances(1, UP_TO_BLOCK)" would hit.
  */
 async function main(): Promise<void> {
+  loadEnvFile();
   const apiKey = process.env.BLOCKMACHINE_API_KEY;
   if (!apiKey) {
     console.error("BLOCKMACHINE_API_KEY is not set. See .env.example.");

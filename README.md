@@ -43,6 +43,34 @@ not built yet since it wasn't asked for. Selectable timeframes/candle sizes beyo
 into 1-minute resolution for a recent window, or real OHLC candlesticks instead of a line) would be
 a bigger, separate feature.
 
+**Found a real infra gap the same day (2026-09-10): price bronze's full backfill history only
+exists locally, not on R2, despite this README's own "bronze now writes to real Cloudflare R2"
+line above.** While wiring gold/silver materialization for a new Google Trends source (see "Social
+metrics" further down), `pipeline:materialize`/`pipeline:export` and `ingest:check-price-coverage`
+turned out to never load `.env` either (the same gap `packages/ingest/src/env.ts` fixed for ingest
+scripts) — every past run of these pipeline commands silently fell back to the local `./data/bronze`
+stand-in instead of honoring `BRONZE_URI=s3://tao-bronze`, and nobody noticed because the local
+stand-in has always had a complete mirror. Checked R2 directly once that was fixed:
+`s3://tao-bronze/prices/` has only 721 rows (Kraken's recent live tail) — none of the real
+multi-venue backfill (Binance/Coinbase/OKX/MEXC, 4M+ rows total) that's actually only ever lived on
+this machine's local disk. **Chain bronze is fine** — `s3://tao-bronze/chain/events/` has the real
+8,974,646 rows spanning blocks 1–8,929,643, matching Phase 2.3 exactly; this is specific to price
+bronze, most likely from an early `ingest:backfill-prices` run before `BRONZE_URI` was consistently
+exported. **Closed the loader gap repo-wide (2026-09-10), not just in `materialize.ts`** — every
+script that touches `BRONZE_URI`, R2 credentials, or `BLOCKMACHINE_API_KEY` now calls
+`loadEnvFile()` first: `ingest:backfill-prices`, `ingest:kraken`, `ingest:check-price-coverage`,
+`chain:ingest`, `chain:backfill`, `spike-g`, `chain:materialize-silver`, `chain:reconcile-balances`
+and `chain:reconcile-checkpoints` all previously depended on the invoking shell already having
+these exported, silently falling back to defaults (or erroring on a missing API key) otherwise.
+`.env` now actually works as documented for every one of them, and **synced all 103 local price
+bronze files up to R2 the same day** — every exchange/pair/month file copied via DuckDB `COPY` straight from local to
+`s3://tao-bronze/prices/...`, same path layout, same `ZSTD`/1M-row-group settings `writeOhlcBronze`
+already uses. Verified two ways: R2 and local now report byte-identical row counts per
+exchange/pair, and `pipeline:materialize`/`pipeline:export` run with no `BRONZE_URI` override
+(i.e. reading only from R2 via `.env`, the normal path) reproduce the exact same gold/export numbers
+as before (`price_composite_usd`: 1,268,539 rows, etc.). Price bronze now has a real cloud copy,
+same as chain bronze always did.
+
 **Two small chart-quality fixes the same day (2026-09-10):**
 
 1. **Hover tooltips showed a date with no year.** `PriceChart.tsx` was the only chart still using
@@ -554,6 +582,81 @@ metric but never ships in `gold.json`; it only feeds `pipeline:cross-rate-check`
 The live rightmost-pixel edge on the TAO/USD chart (`packages/web/lib/useLiveTicker.ts`) connects
 straight from the browser to Kraken's public ticker websocket — no server, no API key. It hasn't
 been exercised against the live socket in this environment; verify it manually with `pnpm web:dev`.
+
+## Social metrics (started 2026-09-10)
+
+Exploratory work, not part of the original plan: correlating price against social attention —
+YouTube view/subscriber growth on curated Bittensor-related channels, and Google Trends search
+interest for "Bittensor". **Kept as two separate metrics by design (user direction, 2026-09-10),
+not folded into one composite** — meant to be optionally overlaid on the price charts rather than
+merged into them. Google Trends has a working silver/gold series now (`social_trends_bittensor_weekly`,
+in `gold.json`); YouTube is still bronze-only (see its subsection below).
+
+### YouTube channel stats
+
+Channel-level, not per-video: one `channels.list` call for every configured channel at once
+(comma-joined `id`), 1 quota unit total regardless of channel count. The API has no historical-delta
+endpoint for a channel you don't own, so daily view/sub *gains* will have to come from diffing
+consecutive daily snapshots once silver exists — the same snapshot-and-diff shape used elsewhere in
+this repo. This also means the series can only start from whenever snapshotting began; there's no
+backfilling past days the way price OHLCV can be backfilled from an exchange's own history.
+
+```
+pnpm youtube:snapshot-channels    # 1 quota unit/day total; writes bronze/social/youtube_channel_stats/<date>.parquet
+```
+
+Requires `YOUTUBE_API_KEY` (free, no billing account needed — enable "YouTube Data API v3" in a
+Google Cloud project, then Credentials -> Create Credentials -> API key). Curated channels live in
+`packages/ingest/src/social/channels.ts` (handle + resolved channel ID + title, mirroring
+`venues.ts`'s "config, not discovery" shape); re-resolve a handle with
+`pnpm --filter @tao-tools/ingest run youtube:resolve-channels` if it's ever reassigned. Confirmed
+working against real R2 2026-09-10 (5 channels, one row each).
+
+**No silver/gold yet — still bronze-only.** When this gets built, the gold layer needs to export
+one series *per channel* (view/sub deltas), not a single pre-summed total: the user wants the web
+UI to let viewers pick which of the configured channels count toward the cumulative daily total
+when this metric is enabled (2026-09-10 direction), which only works if gold ships per-channel
+series for the frontend to sum over a user-chosen subset — summing server-side into one series now
+would make that toggle impossible to add later without a registry version bump and a re-materialize.
+
+### Google Trends search interest
+
+No official API for this — `trendsClient.ts` reverse-engineers the same undocumented
+`trends.google.com/api/*` endpoints `pytrends` wraps (cookie priming, then `explore` for a
+one-time widget token, then `widgetdata/multiline` for the actual series). Confirmed working
+manually 2026-09-10, including hitting and recovering from real 429s during development — this is
+the flakiest data source in the repo and can start returning HTML error pages instead of JSON at
+any time if Google changes the frontend.
+
+Unlike YouTube's cumulative counters, Trends returns the *entire* requested range in one response
+— for "Bittensor" since 2024-04-11 (matching price data's earliest venue history) that's 127 weekly
+points in a single call, since Google auto-downsamples anything past ~9 months to weekly resolution
+regardless of what's asked for (no daily history possible for a range this long). This means
+"backfill" and "refresh" are the same script — re-running it later just re-derives the whole series
+against a later end date. **The 0-100 scale is normalized to the peak within each fetch's own date
+range**, so re-running can shift an old week's value slightly; each bronze row carries `fetched_at_ms`
+so that's traceable rather than silently overwritten.
+
+```
+pnpm trends:backfill    # no API key needed; writes bronze/social/google_trends/<keyword-slug>/<fetch-date>.parquet
+```
+
+Keywords live in `packages/ingest/src/social/trendsKeywords.ts` — just `"Bittensor"` for now
+(bare "TAO" was deliberately avoided, too ambiguous). Confirmed working against real R2 2026-09-10:
+127 points, 2024-04-07 to the current (partial) week, values ranging 4-100.
+
+**Silver/gold built 2026-09-10.** `materializeSilverGoogleTrends` (`packages/pipeline/src/silver/
+materializeGoogleTrends.ts`) collapses bronze's per-fetch-date files down to each keyword's most
+recently fetched series — picked by each row's own `fetched_at_ms`, not the file's date, since
+that's what actually distinguishes two fetches of the same historical week under a different
+0-100 normalization. Wired into `pnpm pipeline:materialize` as an optional step (skips cleanly, no
+error, if `trends:backfill` hasn't been run yet — same "valid empty state" treatment as chain
+silver in a Phase-1-only environment). Gold metric `social_trends_bittensor_weekly` (registry v1)
+just filters to the one keyword and ships in `gold.json` — confirmed end-to-end 2026-09-10: 127
+real points flowing through export.
+
+Neither source is wired into any scheduler yet — same gap as the `chain:*` scripts, run manually.
+No chart renders either series yet (the overlay-on-price-chart UI hasn't been built).
 
 ## Going from local to real infra
 

@@ -226,6 +226,29 @@ export async function materializeGold(registryPath?: string): Promise<Materializ
 
       await createChainSilverViews(null);
 
+      // Optional, same as silver_balance_events above — an environment that
+      // hasn't run `trends:backfill` yet is valid, not an error, so any
+      // metric reading this still materializes with zero rows instead of
+      // crashing every entry after it in the loop.
+      const googleTrendsPath = `${silverDir()}/google_trends.parquet`;
+      if (existsSync(googleTrendsPath)) {
+        await connection.run(
+          `CREATE OR REPLACE VIEW silver_google_trends AS
+           SELECT * FROM read_parquet('${escapeSqlLiteral(googleTrendsPath)}');`,
+        );
+      } else {
+        await connection.run(`
+          CREATE OR REPLACE VIEW silver_google_trends AS
+          SELECT
+            CAST(NULL AS VARCHAR) AS keyword,
+            CAST(NULL AS BIGINT) AS week_start_ms,
+            CAST(NULL AS DOUBLE) AS value,
+            CAST(NULL AS BOOLEAN) AS is_partial,
+            CAST(NULL AS BIGINT) AS fetched_at_ms
+          WHERE FALSE;
+        `);
+      }
+
       // §7.2's hand-curated coldkey -> exchange label set. Read as a view
       // (not embedded in registry SQL) so relabeling an exchange never needs
       // a metric version bump — only the underlying facts changed, not the

@@ -2,6 +2,8 @@ export * from "./types/brands.js";
 export * from "./types/ohlcv.js";
 export * from "./types/goldExport.js";
 export * from "./types/chain.js";
+export * from "./types/youtubeChannelSnapshot.js";
+export * from "./types/googleTrendsPoint.js";
 export * from "./composite.js";
 export * from "./registry/schema.js";
 export * from "./gapDetection.js";

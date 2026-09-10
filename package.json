@@ -14,6 +14,8 @@
     "ingest:backfill-prices": "pnpm --filter @tao-tools/ingest run backfill-prices",
     "ingest:check-price-coverage": "pnpm --filter @tao-tools/ingest run check-price-coverage",
     "spike-g": "pnpm --filter @tao-tools/ingest run spike-g",
+    "youtube:snapshot-channels": "pnpm --filter @tao-tools/ingest run youtube:snapshot-channels",
+    "trends:backfill": "pnpm --filter @tao-tools/ingest run trends:backfill",
     "pipeline:materialize": "pnpm --filter @tao-tools/pipeline run materialize",
     "pipeline:export": "pnpm --filter @tao-tools/pipeline run export",
     "pipeline:cross-rate-check": "pnpm --filter @tao-tools/pipeline run cross-rate-check",

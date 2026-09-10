@@ -1,3 +1,4 @@
+import { loadEnvFile } from "@tao-tools/ingest";
 import { materializeChainSilver } from "../chain/materializeChainSilver.js";
 
 /**
@@ -55,6 +56,7 @@ const MAX_NETWORK_RETRIES = 20;
 const RETRY_DELAY_MS = 30_000;
 
 async function main(): Promise<void> {
+  loadEnvFile();
   for (let attempt = 1; ; attempt++) {
     try {
       console.log(`Materializing chain silver from bronze (resumable — safe to stop and rerun), batchBlocks=${BATCH_BLOCKS}...`);

@@ -12,6 +12,7 @@
  * Requires BLOCKMACHINE_API_KEY. Not run as part of `pnpm test` or Phase 0/1
  * — this hits a real paid-tier endpoint.
  */
+import { loadEnvFile } from "../env.js";
 
 const RPC_URL = "https://rpc.blockmachine.io";
 const GENESIS_BLOCK_NUMBER = 1;

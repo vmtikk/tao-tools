@@ -1,3 +1,4 @@
+import { loadEnvFile } from "../env.js";
 import { createBlockmachineClient } from "../chain/rpcClient.js";
 import { fetchBlockRange } from "../chain/fetchBlockRange.js";
 import { fetchRuntimeMetadata } from "../chain/fetchMetadata.js";
@@ -40,6 +41,7 @@ import { writeChainEventsBronze, writeChainMetadataBronze } from "../chain/bronz
  * at once (see `fetchBlockRange.ts`'s doc comment).
  */
 async function main(): Promise<void> {
+  loadEnvFile();
   const apiKey = process.env.BLOCKMACHINE_API_KEY;
   if (!apiKey) {
     console.error("BLOCKMACHINE_API_KEY is not set. See .env.example.");

@@ -17,7 +17,10 @@
     "check-price-coverage": "tsx src/scripts/checkPriceCoverage.ts",
     "spike-g": "tsx src/scripts/spikeG.ts",
     "chain:ingest": "tsx src/scripts/ingestChainRange.ts",
-    "chain:backfill": "tsx src/scripts/backfillChainEvents.ts"
+    "chain:backfill": "tsx src/scripts/backfillChainEvents.ts",
+    "youtube:resolve-channels": "tsx src/scripts/resolveYoutubeChannels.ts",
+    "youtube:snapshot-channels": "tsx src/scripts/snapshotYoutubeChannels.ts",
+    "trends:backfill": "tsx src/scripts/backfillGoogleTrends.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",

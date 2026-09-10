@@ -422,6 +422,30 @@
   changelog:
     - v1: initial (Phase 3.1)
 
+- name: social_trends_bittensor_weekly
+  version: 1
+  definition: >
+    Weekly Google Trends worldwide search-interest index (0-100) for
+    "Bittensor" — a social-attention series, kept deliberately separate from
+    any price or YouTube metric rather than combined into one composite
+    (user direction, 2026-09-10: "I would want these two metrics as
+    different"). Sourced from silver.google_trends, which already keeps only
+    each keyword's most recently fetched series (see
+    materializeSilverGoogleTrends). The 0-100 scale is normalized to the
+    peak within the fetch's own query window, not an absolute measure across
+    fetches — see trendsClient.ts's docstring. No backfill gap the way chain
+    metrics have one: Trends returns full history in a single call, so this
+    covers the whole queried range (2024-04-11 onward) from the first fetch.
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT week_start_ms AS timestamp_ms, value
+    FROM silver_google_trends
+    WHERE keyword = 'Bittensor'
+    ORDER BY timestamp_ms
+  changelog:
+    - v1: "initial (2026-09-10) — first social-metrics gold series; a future YouTube view/subscriber metric will be a separate series, not folded into this one"
+
 - name: exchange_balances_daily
   version: 1
   definition: >

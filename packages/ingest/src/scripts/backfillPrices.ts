@@ -1,4 +1,5 @@
 import { asUnixMillis, detectGaps, withRetry } from "@tao-tools/core";
+import { loadEnvFile } from "../env.js";
 import { fetchCcxtOhlcv } from "../exchanges/ccxtOhlcv.js";
 import { runResumableVenueBackfill } from "../exchanges/backfill.js";
 import { ALL_VENUES, type PriceVenue } from "../exchanges/venues.js";
@@ -94,6 +95,7 @@ async function backfillVenue(venue: PriceVenue, defaultSinceMs: number): Promise
  * process exits non-zero afterward.
  */
 async function main(): Promise<void> {
+  loadEnvFile();
   const sinceMs = process.env.BACKFILL_SINCE_MS ? Number(process.env.BACKFILL_SINCE_MS) : DEFAULT_SINCE_MS;
 
   for (const venue of ALL_VENUES) {

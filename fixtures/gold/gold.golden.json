@@ -66,6 +66,11 @@
       ]
     },
     {
+      "metric": "social_trends_bittensor_weekly",
+      "version": 1,
+      "points": []
+    },
+    {
       "metric": "exchange_balances_daily",
       "version": 1,
       "points": []

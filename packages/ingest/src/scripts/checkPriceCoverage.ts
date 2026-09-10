@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { DuckDBInstance } from "@duckdb/node-api";
+import { loadEnvFile } from "../env.js";
 import { configureR2Secret } from "../bronze/r2Secret.js";
 import { metaDir, resolveBronzeUri } from "../paths.js";
 import { ALL_VENUES } from "../exchanges/venues.js";
@@ -25,6 +26,7 @@ function formatDate(ms: number): string {
  * never actually read back anywhere until now.
  */
 async function main(): Promise<void> {
+  loadEnvFile();
   const bronzeUri = resolveBronzeUri();
   const isRemote = bronzeUri.startsWith("s3://");
 
