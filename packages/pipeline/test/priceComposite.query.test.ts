@@ -44,3 +44,79 @@ describe("price_composite_usd registry SQL", () => {
     ]);
   });
 });
+
+/**
+ * Tier 2: price_composite_usd_daily (registry v1, added 2026-09-10 —
+ * see price_composite_usd's v3 changelog for why the 1-minute series
+ * stopped shipping to the web chart). depends_on wires its own gold output
+ * as a plain view named "price_composite_usd", matching how materializeGold
+ * actually exposes a dependency (see gold/materialize.ts).
+ */
+describe("price_composite_usd_daily registry SQL", () => {
+  it("takes the last 1-minute value of each UTC day, not the first or an average", async () => {
+    const entries = loadRegistry(REGISTRY_PATH);
+    const entry = entries.find((e) => e.name === "price_composite_usd_daily");
+    if (!entry) throw new Error('registry has no "price_composite_usd_daily" entry');
+
+    const DAY_MS = 86_400_000;
+    const day0 = 0;
+    const day1 = DAY_MS;
+
+    const rows = await withDuckDb(async (connection) => {
+      await connection.run(`CREATE TABLE price_composite_usd (timestamp_ms BIGINT, value DOUBLE);`);
+      await connection.run(`
+        INSERT INTO price_composite_usd VALUES
+          (${day0}, 100),
+          (${day0 + 60_000}, 105),
+          (${day0 + 120_000}, 110),
+          (${day1}, 200),
+          (${day1 + 60_000}, 195);
+      `);
+      const result = await connection.run(entry.sql);
+      return result.getRows();
+    });
+
+    expect(rows.map((r) => [Number(r[0]), Number(r[1])])).toEqual([
+      [day0, 110], // last value of day 0, not the first (100) or the average
+      [day1, 195], // last value of day 1
+    ]);
+  });
+});
+
+/**
+ * Tier 2: price_composite_usd_weekly (registry v1, added 2026-09-10 — a
+ * days/weeks-focused viewer confirmed 1-minute/hourly resolution is
+ * unnecessary). Monday-aligned ISO weeks, not naive epoch-ms division —
+ * 1970-01-01 was a Thursday, so floor(ts / weekMs) would misalign every
+ * bucket boundary to Thursdays instead of the expected Monday start.
+ */
+describe("price_composite_usd_weekly registry SQL", () => {
+  it("takes the last daily value of each ISO (Monday-aligned) week", async () => {
+    const entries = loadRegistry(REGISTRY_PATH);
+    const entry = entries.find((e) => e.name === "price_composite_usd_weekly");
+    if (!entry) throw new Error('registry has no "price_composite_usd_weekly" entry');
+
+    const mon13 = Date.UTC(2023, 10, 13); // Monday — week 1 start
+    const wed15 = Date.UTC(2023, 10, 15); // Wednesday, same week
+    const sun19 = Date.UTC(2023, 10, 19); // Sunday, same week — its last day
+    const mon20 = Date.UTC(2023, 10, 20); // Monday — week 2 start
+
+    const rows = await withDuckDb(async (connection) => {
+      await connection.run(`CREATE TABLE price_composite_usd_daily (timestamp_ms BIGINT, value DOUBLE);`);
+      await connection.run(`
+        INSERT INTO price_composite_usd_daily VALUES
+          (${mon13}, 100),
+          (${wed15}, 105),
+          (${sun19}, 110),
+          (${mon20}, 200);
+      `);
+      const result = await connection.run(entry.sql);
+      return result.getRows();
+    });
+
+    expect(rows.map((r) => [Number(r[0]), Number(r[1])])).toEqual([
+      [mon13, 110], // week of Nov 13-19: last day (Sun 19) wins, not the first or middle
+      [mon20, 200], // week of Nov 20-26, only one day so far
+    ]);
+  });
+});

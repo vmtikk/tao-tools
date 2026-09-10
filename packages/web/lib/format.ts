@@ -26,17 +26,8 @@ export function formatBtc(value: number): string {
   return `${value.toFixed(6)} BTC`;
 }
 
-export function formatTime(timestampMs: number): string {
-  return new Date(timestampMs).toLocaleString("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
 export function formatDay(timestampMs: number): string {
-  return new Date(timestampMs).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return new Date(timestampMs).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
 export function formatCount(value: number): string {

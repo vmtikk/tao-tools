@@ -17,7 +17,8 @@
     "cross-rate-check": "tsx src/scripts/crossRateCheck.ts",
     "chain:materialize-silver": "tsx src/scripts/materializeChainSilver.ts",
     "chain:reconcile-balances": "tsx src/scripts/reconcileBalances.ts",
-    "chain:reconcile-checkpoints": "tsx src/scripts/runReconciliationCheckpoints.ts"
+    "chain:reconcile-checkpoints": "tsx src/scripts/runReconciliationCheckpoints.ts",
+    "chain:estimate-reconciliation-rpc": "tsx src/scripts/estimateReconciliationRpc.ts"
   },
   "dependencies": {
     "@tao-tools/core": "workspace:*",

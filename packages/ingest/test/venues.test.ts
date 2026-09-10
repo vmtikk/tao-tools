@@ -7,15 +7,25 @@ describe("venue registry", () => {
     expect(new Set(keys).size).toBe(keys.length);
   });
 
-  it("matches the plan's §4.1 venue table", () => {
+  it("matches the trimmed venue list (2026-09-10, after a real backfill run found several non-functional)", () => {
     expect(USD_VENUES.map((v) => v.exchange).sort()).toEqual(["coinbase", "kraken"]);
-    expect(USDT_VENUES.map((v) => v.exchange).sort()).toEqual(["binance", "bybit", "gate", "mexc", "okx"]);
-    expect(BTC_VENUES.map((v) => v.exchange).sort()).toEqual(["kraken", "upbit"]);
+    // Bybit (no TAO/USDT market under ccxt) and Gate.io (hard 7-day history
+    // cap, can't backfill) were dropped — see venues.ts's doc comment.
+    expect(USDT_VENUES.map((v) => v.exchange).sort()).toEqual(["binance", "mexc", "okx"]);
+    // Empty: both plan-listed BTC venues turned out non-functional (Kraken
+    // has no TAO/BTC market; Upbit returns 0 candles). price_composite_btc
+    // has no data source until a real replacement venue is found.
+    expect(BTC_VENUES).toEqual([]);
   });
 
-  it("has a reference BTC/USD venue for the cross-rate check", () => {
-    expect(REFERENCE_VENUES).toHaveLength(1);
-    expect(REFERENCE_VENUES[0]).toMatchObject({ pair: "BTCUSD" });
+  it("has reference BTC venues for the cross-rate check, including a deep-history one", () => {
+    // Kraken's BTC/USD is thin (live-tail only, same limitation as its TAO
+    // pairs); Binance's BTC/USDT has real deep history and is what the
+    // cross-rate check can actually validate against pre-2025 data with.
+    expect(REFERENCE_VENUES.map((v) => `${v.exchange}:${v.pair}`).sort()).toEqual([
+      "binance:BTCUSDT",
+      "kraken:BTCUSD",
+    ]);
   });
 
   it("ALL_VENUES is the union of every group", () => {

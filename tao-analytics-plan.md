@@ -227,6 +227,26 @@ a thin adapter in `ingest` and a contract test against a recorded response (§6)
 **Volume caveat to surface in the chart itself:** you only count venues you poll. The series will
 undercount versus aggregators, especially in early history. Label it.
 
+**Findings (2026-09-10, a real backfill run): the TAO/BTC venue table above doesn't hold up.**
+Neither Kraken nor Upbit actually has a real TAO/BTC market — Kraken's ccxt market list has no
+`TAO/BTC` symbol at all, and Upbit returns zero candles even for a recent `since` with no error.
+`BTC_VENUES` (`packages/ingest/src/exchanges/venues.ts`) is empty and expected to stay that way —
+no reputable exchange appears to list this pair. Bybit and Gate.io were also dropped from the
+TAO/USDT list the same day: Bybit has no `TAO/USDT` market under ccxt either, and Gate.io hard-caps
+history at ~7 days via its own API (`"Candlestick too long ago. Maximum 10000 points ago are
+allowed"`), so it can't contribute to a 2023-onward backfill at all. Kraken itself turned out to
+only serve a live-tail window for 1-minute candles regardless of `since` (no error, just today's
+data) — real for current pricing, useless for backfill.
+
+**Consequently, `price_composite_btc` is now an implied cross-rate, not a direct composite** —
+`price_composite_usd ÷ reference_btc_usd` (registry v2), constructed from the two real USD-quoted
+composites rather than a nonexistent direct pair. This retires the "automated sanity check" above
+in its original form: it compared an independently-sourced TAO/BTC price against the implied ratio
+to catch a stale/mislabeled venue, and now those two values are the same thing by construction, so
+the check can never diverge again. See the README's "Chart 2 redefined as an implied cross-rate"
+section for the full account, including what `reference_btc_usd` itself needed (Binance's
+`BTC/USDT`, since Kraken's `BTC/USD` has the identical live-tail-only limitation).
+
 ### 4.2 Chain access — Blockmachine
 
 - Endpoints: `https://rpc.blockmachine.io` (HTTP), `wss://rpc.blockmachine.io` (WS)
@@ -619,14 +639,21 @@ checkpoints" clause is still outstanding.)
    silently duplicated one batch into silver (1,447 duplicate transfer rows in blocks
    5,425,008–5,427,996, since repaired), and a hard power-off can leave the JSON checkpoint
    NUL-filled while the staging DB stays intact, which is recoverable.
-3. ❌ **Still the actual blocker, and now the only one** — run `chain:reconcile-checkpoints` with
-   `UP_TO_BLOCK=8929643` (silver now covers the full range, so the old "once it's caught back up"
+3. ⚠️ **Sized 2026-09-09, not yet run — now the only remaining step.** Run `chain:reconcile-checkpoints`
+   with `UP_TO_BLOCK=8929643` (silver now covers the full range, so the old "once it's caught back up"
    caveat is gone). Three real-data attempts on 2026-09-05 all failed before reaching a verdict (see
    Phase 3.1's entries below); this has still never completed against real (non-fixture) chain data.
-   Needs RU budget. **Size it before spending any**: it re-verifies every earlier window on each
-   invocation, ~41 windows against 505,493 distinct coldkeys, and has never been run at that scale.
-   `packages/pipeline/src/scripts/estimateReconciliationRpc.ts` estimates the call count locally
-   with no RPC; at ~1 RU/call (§4.2) that converts straight to budget.
+   `packages/pipeline/src/scripts/estimateReconciliationRpc.ts` (built 2026-09-09; logic in
+   `packages/pipeline/src/chain/estimateReconciliationRpc.ts`, fixture-tested in
+   `estimateReconciliationRpc.query.test.ts`) estimates the call count locally with no RPC, as a
+   single DuckDB query over silver bucketing block_number by window — exactly mirroring
+   `reconcileBalances`'s touched/newly-touched accounting. **Run against the real full range:
+   1,181,375 actual-balance reads + 492,669 baseline reads + 123 window-overhead calls = 1,674,167
+   total calls ≈ 1.67M RU at ~1 RU/call (§4.2) — about 8% of Pro's 20M/month quota.** The concern
+   that motivated sizing this first (a naive 41-windows-of-505K-coldkeys guess could have overshot
+   the monthly quota the backfill itself blew through) didn't materialize: reconciliation is far
+   cheaper than the backfill because most of the 505,493 coldkeys are touched once, not every
+   window. Budget is no longer the open question — the run itself just needs to happen.
 4. Phase 3's `account_balances_daily` (3.1) and the two wallet-count series have now been built and
    run against the **complete** index, but still ahead of step 3 passing — **their numbers remain
    provisional** until reconciliation actually confirms the fold. There is now hard evidence that

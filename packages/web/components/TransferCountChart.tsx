@@ -3,17 +3,19 @@
 import { useMemo, useState } from "react";
 import type { GoldSeriesPoint } from "@tao-tools/core";
 import { niceTicks } from "../lib/niceTicks";
-import { formatTime, formatCount } from "../lib/format";
+import { arrayMax, arrayMin } from "../lib/arrayExtent";
+import { formatDay, formatCount } from "../lib/format";
 
 const WIDTH = 960;
 const HEIGHT = 280;
 const MARGIN = { top: 16, right: 40, bottom: 28, left: 8 };
 
 /**
- * Transfer count per block (tao-analytics-plan.md §6, Phase 2.1 tracer
- * bullet). Same bar-chart shape as VolumeChart — a count-per-bucket series —
- * but x is per-block (seconds apart, not per-day), so the tooltip uses a
- * time-of-day formatter instead of a date-only one.
+ * Daily transfer count (tao-analytics-plan.md §6, transfer_count_daily).
+ * Same bar-chart shape as VolumeChart, one bar per UTC day — v1 of this
+ * metric was per-block (transfer_count_per_block), which produced 1.3M
+ * points against the real backfill and neither loaded nor rendered in a
+ * browser; v2 rebucketed to daily, matching every other chart here.
  */
 export function TransferCountChart({ points }: { points: GoldSeriesPoint[] }) {
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
@@ -26,9 +28,9 @@ export function TransferCountChart({ points }: { points: GoldSeriesPoint[] }) {
 
     const xs = points.map((p) => p.timestampMs);
     const ys = points.map((p) => p.value);
-    const xMin = Math.min(...xs);
-    const xMax = Math.max(...xs);
-    const yMax = Math.max(...ys, 0);
+    const xMin = arrayMin(xs);
+    const xMax = arrayMax(xs);
+    const yMax = Math.max(arrayMax(ys), 0);
 
     const yTicks = niceTicks(0, yMax || 1, 4);
     const yTop = yTicks.at(-1)!;
@@ -80,7 +82,7 @@ export function TransferCountChart({ points }: { points: GoldSeriesPoint[] }) {
       <svg
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         role="img"
-        aria-label="Transfer count per block bar chart"
+        aria-label="Daily transfer count bar chart"
         onMouseMove={handleMove}
         onMouseLeave={() => setHoverIndex(null)}
       >
@@ -109,7 +111,7 @@ export function TransferCountChart({ points }: { points: GoldSeriesPoint[] }) {
 
       {hovered && (
         <div className="tooltip" style={{ left: `${(xScale(hovered.timestampMs) / WIDTH) * 100}%` }}>
-          <div className="tooltip-time">{formatTime(hovered.timestampMs)}</div>
+          <div className="tooltip-time">{formatDay(hovered.timestampMs)}</div>
           <div className="tooltip-value">{formatCount(hovered.value)} transfers</div>
         </div>
       )}

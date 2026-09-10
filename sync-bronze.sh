@@ -13,7 +13,7 @@ set -euo pipefail
 #
 # CAVEAT: shares data/meta/chain_backfill_checkpoint.json with a manual
 # one-off `chain:backfill` run. Never run both at once.
-#
+# 
 # Recommended runner: systemd timer, see deploy/tao-sync.{service,timer} —
 # follow logs live with `journalctl -u tao-sync -f`.
 

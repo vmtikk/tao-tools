@@ -3,7 +3,8 @@
 import { useMemo, useState } from "react";
 import type { GoldSeriesPoint } from "@tao-tools/core";
 import { niceTicks } from "../lib/niceTicks";
-import { formatBtc, formatTime, formatUsd } from "../lib/format";
+import { arrayMax, arrayMin } from "../lib/arrayExtent";
+import { formatBtc, formatDay, formatUsd } from "../lib/format";
 
 const WIDTH = 960;
 const HEIGHT = 360;
@@ -45,10 +46,10 @@ export function PriceChart({ points, unit = "usd", ariaLabel = "Price line chart
       xs.push(livePoint.timestampMs);
       ys.push(livePoint.value);
     }
-    const xMin = Math.min(...xs);
-    const xMax = Math.max(...xs);
-    const yMinRaw = Math.min(...ys);
-    const yMaxRaw = Math.max(...ys);
+    const xMin = arrayMin(xs);
+    const xMax = arrayMax(xs);
+    const yMinRaw = arrayMin(ys);
+    const yMaxRaw = arrayMax(ys);
     const yPad = (yMaxRaw - yMinRaw) * 0.1 || yMaxRaw * 0.05 || 1;
 
     const yTicks = niceTicks(yMinRaw - yPad, yMaxRaw + yPad, 5);
@@ -152,7 +153,7 @@ export function PriceChart({ points, unit = "usd", ariaLabel = "Price line chart
           className="tooltip"
           style={{ left: `${(xScale(hovered.timestampMs) / WIDTH) * 100}%` }}
         >
-          <div className="tooltip-time">{formatTime(hovered.timestampMs)}</div>
+          <div className="tooltip-time">{formatDay(hovered.timestampMs)}</div>
           <div className="tooltip-value">{valueFormatter(hovered.value)}</div>
         </div>
       )}
@@ -173,7 +174,7 @@ export function PriceChart({ points, unit = "usd", ariaLabel = "Price line chart
             <tbody>
               {points.map((p) => (
                 <tr key={p.timestampMs}>
-                  <td>{formatTime(p.timestampMs)}</td>
+                  <td>{formatDay(p.timestampMs)}</td>
                   <td>{valueFormatter(p.value)}</td>
                 </tr>
               ))}

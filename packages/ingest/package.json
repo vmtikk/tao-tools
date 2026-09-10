@@ -14,6 +14,7 @@
     "test": "vitest run",
     "kraken:phase0": "tsx src/scripts/ingestKrakenPhase0.ts",
     "backfill-prices": "tsx src/scripts/backfillPrices.ts",
+    "check-price-coverage": "tsx src/scripts/checkPriceCoverage.ts",
     "spike-g": "tsx src/scripts/spikeG.ts",
     "chain:ingest": "tsx src/scripts/ingestChainRange.ts",
     "chain:backfill": "tsx src/scripts/backfillChainEvents.ts"

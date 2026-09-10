@@ -12,6 +12,7 @@
     "typecheck": "pnpm -r run typecheck",
     "ingest:kraken": "pnpm --filter @tao-tools/ingest run kraken:phase0",
     "ingest:backfill-prices": "pnpm --filter @tao-tools/ingest run backfill-prices",
+    "ingest:check-price-coverage": "pnpm --filter @tao-tools/ingest run check-price-coverage",
     "spike-g": "pnpm --filter @tao-tools/ingest run spike-g",
     "pipeline:materialize": "pnpm --filter @tao-tools/pipeline run materialize",
     "pipeline:export": "pnpm --filter @tao-tools/pipeline run export",

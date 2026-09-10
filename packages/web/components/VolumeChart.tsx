@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import type { GoldSeriesPoint } from "@tao-tools/core";
 import { niceTicks } from "../lib/niceTicks";
+import { arrayMax, arrayMin } from "../lib/arrayExtent";
 import { formatDay, formatUsdCompact } from "../lib/format";
 
 const WIDTH = 960;
@@ -20,9 +21,9 @@ export function VolumeChart({ points }: { points: GoldSeriesPoint[] }) {
 
     const xs = points.map((p) => p.timestampMs);
     const ys = points.map((p) => p.value);
-    const xMin = Math.min(...xs);
-    const xMax = Math.max(...xs);
-    const yMax = Math.max(...ys, 0);
+    const xMin = arrayMin(xs);
+    const xMax = arrayMax(xs);
+    const yMax = Math.max(arrayMax(ys), 0);
 
     const yTicks = niceTicks(0, yMax || 1, 4);
     const yTop = yTicks.at(-1)!;

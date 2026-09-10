@@ -9,6 +9,58 @@ backfill is complete — the full genesis-to-head event index (blocks 1–8,929,
 2026-09-09.** Every venue is fetched through `ccxt` (§2 stack), including Kraken — the Phase 0
 hand-rolled Kraken REST client was migrated in Phase 1. Blockmachine Pro is active.
 
+**`gold.json` was 248MB and unusable in a browser (2026-09-10) — fixed.** Once real price backfill
+history landed (previous sections), `price_composite_usd`/`price_composite_btc` alone produced
+1,268,539 1-minute points each — a hand-rolled SVG chart (`PriceChart.tsx`, no charting library)
+built one path command per point, linear-scanned all of them on every mouse move, and would have
+rendered 1.27M `<tr>` rows if the table view were toggled, on top of the 248MB download itself. The
+plan's own §9 flags ~5-10MB as where a static JSON export stops working; this was ~25-50x past
+that. **Fixed the same way `volume_usd_daily`/`transfer_count_daily` already handle this**: added
+`price_composite_usd_daily` and `price_composite_btc_daily` (registry v1, last 1-minute value per
+UTC day via `arg_max`), and marked the 1-minute composites `export: false` — still materialized
+locally (needed for `price_composite_btc`'s join and any future per-minute join, e.g. Phase 4 cost
+basis), just not shipped to the browser. Result: **883 points instead of 1.27M per series,
+`gold.json` down to 688KB.** `page.tsx` now points at the `_daily` metrics; a real
+`next build` confirms the homepage still statically prerenders. Chart 2's caveat text was also
+corrected to actually say "implied, not observed" (previously stale "Composite across Kraken and
+Upbit only," left over from before that redefinition).
+
+**Weekly rollups added too (same day)** — confirmed the intended use case is days/weeks, not
+1-minute or hourly. Added `price_composite_usd_weekly` / `price_composite_btc_weekly` (127 points
+each, built from the daily rollup rather than the 1-minute series — cheaper, and the last day's
+close within a week is the same value either way). **Caught a real bug writing these**: the first
+attempt used DuckDB's `date_trunc('week', to_timestamp(...))`, which truncates in the DuckDB
+session's *local* timezone by default, not UTC — a test comparing against `Date.UTC(...)`-computed
+expectations caught a 2-hour offset immediately. Since `materializeGold` could run on any machine,
+that would have silently shifted week boundaries depending on where the pipeline happened to run —
+a reproducibility bug, not just a test mismatch. Replaced with pure UTC-anchored integer arithmetic
+(`((timestamp_ms + 3 days) // 7 days) * 7 days - 3 days`, anchored to the fact that the Unix epoch
+was a Thursday, so the preceding Monday is exactly 3 days earlier) — the same style already used
+for daily bucketing, just correctly generalized to weeks. `gold.json` is now 729KB across 9 series,
+still nowhere near the plan's ~5-10MB comfort line. The chart itself still renders daily by default
+(unchanged) — the weekly series are available in `gold.json` for whenever a UI toggle is wanted;
+not built yet since it wasn't asked for. Selectable timeframes/candle sizes beyond day/week (zoom
+into 1-minute resolution for a recent window, or real OHLC candlesticks instead of a line) would be
+a bigger, separate feature.
+
+**Two small chart-quality fixes the same day (2026-09-10):**
+
+1. **Hover tooltips showed a date with no year.** `PriceChart.tsx` was the only chart still using
+   `formatTime` — a relic from when its data was 1-minute resolution and showing hour:minute
+   actually meant something; now that it's daily too, that always read "12:00 AM" noise. Removed
+   `formatTime` and switched `PriceChart` to `formatDay` (already what `VolumeChart`/
+   `TransferCountChart` use for their daily data), and added `year: "numeric"` to `formatDay` itself
+   — fixes the missing year across all three charts' tooltips in one change, not just price.
+2. **`volume_usd_daily` summed every USD/USDT venue, which made the series internally
+   incomparable.** Venues came online at very different points (Binance 2024-04, Coinbase 2025-03,
+   OKX 2026-06, MEXC 2026-08) — the daily total jumped every time a new venue's history started,
+   not because trading activity actually changed; a day with 1 contributing venue sat right next to
+   a day with 4. **Restricted to Binance only** (registry v1→v2) — it's the only venue with volume
+   for the whole window (2024-04-11 → today), so every point in the resulting series is now
+   comparable to every other, at the cost of undercounting once the other venues are also trading.
+   `page.tsx`'s subtitle and caveat text updated to say so explicitly, and to state the currency
+   (USD) directly rather than only implying it via venue names.
+
 **Phase 3's numbers are still provisional, and this is the one thing blocking the project.**
 `chain:reconcile-checkpoints` has never completed against real chain data — only against fixtures
 — so nothing in the fold has been checked against on-chain ground truth. There is now concrete
@@ -18,9 +70,11 @@ negative balance across 10,620 distinct coldkeys** (~2% of all 505,493), and
 impossible; these are the genesis-funded accounts of plan §10 (funded directly in genesis state,
 so no `Deposit` event ever fires and the fold starts them at zero). Fixing it needs real
 `System.Account` reads — i.e. the same RPC work reconciliation needs. Don't treat wallet counts or
-exchange balances as final until that run comes back clean. RU cost also still needs a
-Blockmachine-dashboard check (§4.2) — the backfill alone spent roughly 26.8M RPC calls on top of
-the ~192,000 spent sampling, and reconciliation across 505,493 coldkeys has never been sized.
+exchange balances as final until that run comes back clean. **Reconciliation is now sized and it's
+cheap**: `pnpm chain:estimate-reconciliation-rpc` (new 2026-09-09, no RPC calls) puts the full
+genesis-to-head run at **~1.67M RPC calls ≈ 1.67M RU**, well inside Pro's 20M/month quota — budget
+was the open question, not a blocker. `chain:reconcile-checkpoints` itself just needs to actually
+be run against real chain data next.
 
 ## Setup
 
@@ -44,14 +98,229 @@ pnpm pipeline:cross-rate-check   # sanity check: composite USD ÷ BTC/USD should
 pnpm web:dev                     # http://localhost:3000 — renders all three charts from gold.json
 ```
 
-`ingest:backfill-prices` is a real, potentially long-running pull against seven exchanges — it
-has not been run against live APIs yet (only unit/contract-tested against fixtures and injected
-fetchers). Run it manually when ready; it's resumable in the sense that re-running it just
-re-fetches and dedupes in silver, so a partial/interrupted run is not destructive. **This is why
-the price charts are near-empty** while the chain charts span the full history: the current
-`gold.json` carries 587 points for `price_composite_usd` and none at all for `price_composite_btc`,
-because silver only holds whatever thin OHLCV has been pulled so far. Unrelated to any of the chain
-work — it's a Phase 1 gap.
+`ingest:backfill-prices` is a real, potentially long-running pull against the venues in
+`ALL_VENUES` — 6 venue/pair combinations as of 2026-09-10 (see the trim below), back to each one's
+own earliest available candle. **Bronze backfill for USD-denominated venues is now complete**
+(2026-09-10, see the detailed writeup below) — Binance, Coinbase, OKX, and MEXC each have their
+full real history through today; Kraken is permanently limited to a live-tail window by its own
+API, not a gap to chase further. **The price charts are still near-empty regardless**, because
+bronze hasn't been materialized yet: `gold.json` still reflects an old partial pull (587 points
+for `price_composite_usd`) until `pipeline:materialize` + `pipeline:export` are rerun against the
+now-complete bronze. `price_composite_btc` will stay empty either way — no working TAO/BTC venue
+exists yet (see `BTC_VENUES` below). Unrelated to any of the chain work — it's a Phase 1 gap.
+
+**Resumable per venue, checkpointed to `data/meta/price_backfill_checkpoint.json`** (built
+2026-09-09, replacing an earlier version that buffered a venue's entire multi-year history in
+memory before writing anything). Run it yourself, in your own terminal, so you can watch it live:
+
+```
+pnpm ingest:backfill-prices
+```
+
+What you'll see: one line per page fetched (`kraken TAOUSD: page 42, +720 candles (reached
+2023-06-02T...), 30240 fetched this run.`) and one line whenever a completed month is durably
+written to bronze and checkpointed (`kraken TAOUSD: checkpoint saved at 2023-06-01T...`). **Stop it
+any time — Ctrl+C, close the terminal, shut down the computer — and rerun the exact same command
+later; it resumes each venue from its own last checkpointed month instead of re-fetching from 2023.**
+A crash between two checkpoint saves loses at most the one month that was still being assembled
+when it died, never anything already flushed. Nine venues run one after another in the same
+process, so a restart also correctly skips straight to whichever venue was mid-flight (each venue's
+checkpoint is independent — `data/meta/price_backfill_checkpoint.json` is one JSON object keyed by
+`exchange:pair`).
+
+To force a full re-backfill for one venue (e.g. after a bug fix in the normalizer), delete that
+venue's entry from the checkpoint file, or delete the whole file to restart everything. An explicit
+`BACKFILL_SINCE_MS` override only takes effect for a venue that has no checkpoint yet — it can't
+silently discard resume progress.
+
+Verified against the real Kraken API (2026-09-09, a 3-hour smoke window, not committed): the real
+page-by-page flow — live ccxt call, incremental bronze write, checkpoint save, then a simulated
+restart — fetched the expected 180 one-minute candles on the first run and correctly resumed to 0
+new candles on the second (already caught up).
+
+**First real user run (2026-09-09) surfaced three distinct failure modes, only one of which is
+actually fixable in our code — worth knowing before assuming a low row count means "it crashed":**
+
+1. **Binance worked correctly and can be trusted as-is** — real data from its actual listing date
+   (2024-04) through today. No issue.
+2. **Kraken and Gate.io cannot serve deep 1-minute history at all, and no amount of retrying
+   fixes this.** Kraken's public OHLC endpoint silently ignores an old `since` and just returns
+   whatever's most recent — no error, so it *looks* like it worked, but it's a live tail, not
+   history (confirmed by direct probe: asking Kraken for `since=2023-01-01` returned today's
+   candles). Gate.io is more honest about the same limit: `"Candlestick too long ago. Maximum
+   10000 points ago are allowed"` (~7 days at 1-minute resolution). Both venues can still
+   contribute to the live edge going forward; neither can backfill 2023-onward 1-minute history.
+3. **Coinbase, OKX, and MEXC each have a real, later listing date, but their OHLCV endpoint
+   returns an *empty* page for a `since` before it instead of clamping to their own earliest
+   candle** (which is what Binance's endpoint does for us automatically). `paginateOhlcv`'s
+   "stop on an empty page" rule — correct for "history has ended" — was misreading "history
+   hasn't started yet" the same way, permanently stalling these three venues at zero rows on
+   every run. **Fixed (2026-09-09):** `findEarliestAvailableSinceMs`
+   (`packages/ingest/src/exchanges/backfill.ts`) binary-searches forward from the default anchor
+   to find each venue's real earliest candle before paginating, using cheap `limit: 1` probes
+   (~10 calls for a 3-year range at 1-day precision). Verified against the real APIs: Coinbase
+   now resolves to 2025-03-16, OKX to 2026-07-01, MEXC to 2026-08-10 — all previously stuck at
+   zero. Wired in via `mayPredateHistory`, which `backfillPrices.ts` sets `true` only on a venue's
+   *first* run (`!checkpoint`) — on a resume, an empty page at the checkpoint's sinceMs correctly
+   means "caught up to the live edge," and searching forward there would be wrong.
+   Bybit (`"bybit does not have market symbol TAO/USDT"`) and Kraken's `TAO/BTC` entry
+   (`"kraken does not have market symbol TAO/BTC"`, contradicting plan §4.1's venue table) are a
+   different problem — wrong/missing symbol config in `venues.ts`, not a history-depth issue.
+   Upbit's `TAO/BTC` returns 0 candles even for a *recent* window with no error, suggesting no
+   real listing/liquidity there.
+
+**A second real bug (2026-09-10), found immediately after the fix above: Coinbase, OKX, and MEXC
+each stopped again after fetching only a small amount of data, this time correctly starting from
+their real listing dates.** Not a crash — `paginateOhlcv` had a second stopping rule, `if
+(raw.length < limit) break` (meant to detect "history exhausted"), that can't tell that apart from
+"this venue's API caps its own response below what I asked for." Confirmed directly: asking for
+720 candles/page, Coinbase returns 270, OKX 300, MEXC 224 — while Binance and Kraken honor 720 in
+full. So the three capped venues stopped for good after their very first page, no matter how much
+real history remained. **Fixed:** removed that stopping rule entirely — an empty page (genuinely
+"nothing here") and reaching the live edge are the only reliable "stop" signals; a short-but-
+nonempty page just means more pages are needed to cover the same span. Verified against the real
+Coinbase API: fetching 3 pages at `limit: 720` from just after its listing date now returns 792
+candles (270 + 270 + 252) spanning forward correctly, instead of stopping at ~270 after page one.
+
+**Venue list trimmed (2026-09-10)**, based on the failures above. `packages/ingest/src/exchanges/venues.ts`
+now drops:
+- **Bybit** (`USDT_VENUES`) — no working `TAO/USDT` market under ccxt, confirmed with both an old
+  and a recent `since`. Not a history-depth issue; the pair mapping is simply wrong or absent.
+- **Gate.io** (`USDT_VENUES`) — hard-capped at ~7 days of history by its own API
+  (`"Candlestick too long ago. Maximum 10000 points ago are allowed"`); can't contribute to a
+  2023-onward backfill at all.
+- **Upbit** (`BTC_VENUES`) — 0 candles even for a recent window, no real listing found.
+
+**`BTC_VENUES` is now empty** — Kraken, the other plan-listed TAO/BTC venue, also has no working
+`TAO/BTC` market under ccxt (confirmed with both an old and recent `since`), so dropping Upbit
+leaves zero working sources for `price_composite_btc` (chart 2). This isn't new breakage from the
+trim — neither venue ever produced real TAO/BTC data — it's just made explicit now instead of two
+silently-failing entries. **Chart 2 has no data source until a real TAO/BTC venue is found and
+added.**
+
+Kept: Kraken (`TAOUSD`, `BTCUSD` reference), Coinbase (`TAOUSD`), Binance (`TAOUSDT`), OKX
+(`TAOUSDT`), MEXC (`TAOUSDT`) — OKX and MEXC both have real, working data despite young listing
+dates (2026-07 and 2026-08 respectively); a short history isn't a data-quality problem, it just
+means the composite has fewer contributing venues before those dates.
+
+**Checking what's actually in bronze**, rather than re-deriving it from the checkpoint file and a
+hand-rolled query each time:
+
+```
+pnpm ingest:check-price-coverage
+```
+
+Read-only, no RPC — reports each venue's row count, date range, and distinct months present, plus
+a summary of any gaps `backfillPrices.ts` already logged to `ingestion_log.parquet` (existed since
+Phase 1.2, never actually surfaced anywhere until now). **State as of 2026-09-10, after the fourth
+fix below and a rerun (before the fifth fix — see next):**
+
+| Venue | Pair | Range | Rows |
+|---|---|---|---|
+| kraken | TAOUSD | 2026-08-25 → 2026-09-10 (16d) | 762 |
+| coinbase | TAOUSD | 2025-03-12 → 2025-10-25 (228d) | 307,479 |
+| binance | TAOUSDT | 2024-04-11 → 2026-09-10 (882d) | 1,269,682 |
+| okx | TAOUSDT | 2026-06-30 → 2026-09-10 (71d) | 102,544 |
+| mexc | TAOUSDT | 2026-08-11 → 2026-09-10 (29d) | 42,177 |
+| kraken | BTCUSD | 2026-09-10 only (0d) | 31 |
+
+Kraken's two rows confirm the known, unfixable limitation above — both stuck at a thin recent
+window, not real history. Coinbase's ~20,329 missing 1-minute buckets (out of ~328,000 possible
+over its 228-day span, in ~16,800 mostly 1-2-minute gaps, largest 36 minutes) look like ordinary
+low-liquidity trading gaps — no trade in a given minute means no candle for that minute — not a bug.
+
+**A fourth real bug, found by comparing two consecutive runs' coverage**: OKX and MEXC's row counts
+had *decreased* between runs (impossible for a supposedly-additive backfill), and on-disk file
+sizes confirmed it — `2026-09.parquet` was 2.3KB for binance and ~2.2KB for OKX/MEXC, vs.
+~800KB/~720KB/~600KB for every other full month. **`writeOhlcBronze` used to be a plain overwrite**,
+and `runResumableVenueBackfill` only ever buffers rows fetched *during the current run* — so the
+month containing "now" gets revisited across every future resumed run (it's never "closed" like an
+earlier month is), and each revisit silently replaced the whole file with just that run's small
+increment, discarding everything earlier runs had written for the same month. **Fixed:**
+`writeOhlcBronze` (`packages/ingest/src/bronze/writer.ts`) now reads whatever's already at the
+destination (if anything) and merges it with the new rows, deduplicated by `timestamp_ms`, before
+writing — a brand-new month (no existing file) behaves exactly as before. 4 new tests in
+`test/writer.test.ts` lock this in, including the exact regression shape (a small second write must
+not shrink the file). Binance, OKX, and MEXC's September checkpoints were rolled back to
+2026-09-01 (in `data/meta/price_backfill_checkpoint.json`, not committed) so a rerun re-fetched and
+correctly merged September's actually-lost days back in — the table above already reflects that
+recovery (binance went from 1,256,413 to 1,269,682, etc.).
+
+**A fifth real bug, found because Coinbase stayed at exactly 307,479 rows across three consecutive
+reruns** — not a crash, a specific empty page with no error, confirmed by probing the exact resume
+point directly (`2025-10-25T15:13:00Z`: 0 candles) and finding real data resumes the very next day.
+Same failure class as the "empty page at listing date" fix from before, just occurring *mid-history*
+on a *resume* instead of at the very start — and the original fix only searched forward on a fresh
+run, since an empty page on a resume is normally the correct, frequent signal for "caught up to the
+live edge." Those two cases turned out to need the same underlying handling, just triggered
+differently: **generalized (`withGapSkipping` in `backfill.ts`)** — any empty page still
+meaningfully behind `nowMs` (not just a first-run page) now searches forward via
+`findEarliestAvailableSinceMs` before giving up; an empty page already at/near the live edge is left
+alone exactly as before, so this costs nothing extra on the common "already caught up" case that
+happens on nearly every resumed run. The old `mayPredateHistory` option is gone — this subsumes it.
+Verified against the real stuck point: `runResumableVenueBackfill` from `2025-10-25T15:13:00Z` now
+returns 596 real candles starting the next day, instead of the 0 it was stuck on for three runs.
+2 new tests in `backfill.test.ts` (16 total) cover both the original and the mid-history shape.
+
+**Confirmed fixed for real (2026-09-10, after a rerun): Coinbase jumped from 307,479 rows (stuck at
+2025-10-25) to 741,456 rows, now spanning 2025-03-12 through today** — fully caught up alongside
+Binance, OKX, and MEXC. **This is the actual end state for Phase 1.2's backfill**, not another
+partial run: every venue with retrievable history now has its full history.
+
+| Venue | Pair | Range | Status |
+|---|---|---|---|
+| binance | TAOUSDT | 2024-04-11 → today | Fully caught up |
+| coinbase | TAOUSD | 2025-03-12 → today | Fully caught up |
+| okx | TAOUSDT | 2026-06-30 → today | Fully caught up |
+| mexc | TAOUSDT | 2026-08-11 → today | Fully caught up |
+| kraken | TAOUSD | 16 days only | Permanent venue limit (§4.2/above) — live tail only |
+| kraken | BTCUSD | today only | Permanent venue limit — live tail only |
+
+Kraken's two thin rows are not a bug to keep chasing — confirmed multiple times that its public
+OHLC endpoint simply doesn't serve deep 1-minute history, no error, just recent-window-only data
+regardless of `since`. It still earns its place in the composite for current/recent-day pricing.
+
+**The reference BTC/USD venue had the same limitation, fixed the same way (2026-09-10).**
+`reference_btc_usd` (the BTC/USD leg of the cross-rate check, §4.1 — not a chart) only had
+Kraken's `BTC/USD`, which turned out just as thin as Kraken's TAO pairs — `since=2023-01-01`
+returns today's candles, not real history. Checked Binance as an alternative: its own `BTC/USD` is
+real but only listed since ~2025-12 (same "thin recent pair" shape, just less severe), while its
+`BTC/USDT` has full deep history back to at least 2023-01-01 — confirmed directly, a
+`since=2023-01-01` fetch returns candles starting exactly there. Added `binance:BTCUSDT` to
+`REFERENCE_VENUES` (`venues.ts`) and widened `reference_btc_usd`'s SQL from `pair = 'BTCUSD'` to
+`pair IN ('BTCUSD', 'BTCUSDT')` — the same USDT-as-USD-equivalent treatment `price_composite_usd`
+already uses (registry version bumped 1→2 per §8's rule). Kraken stayed in rather than being
+swapped out — its thin recent data doesn't hurt anything and still contributes real current-day
+pricing.
+
+**Chart 2 (`price_composite_btc`) redefined as an implied cross-rate (2026-09-10)** — no reputable
+exchange lists a real, continuously-tradable TAO/BTC pair at all (confirmed: Kraken's market list
+has no `TAO/BTC` symbol; Upbit returns zero candles even for a recent `since`, no error), so
+`BTC_VENUES` stays empty rather than chasing a venue that doesn't exist. Instead of leaving chart 2
+permanently blank, `price_composite_btc` (registry v1→v2) is now constructed as
+`price_composite_usd ÷ reference_btc_usd` — the same synthetic-cross-rate technique a trader would
+use to price an illiquid pair by routing through a common quote currency, using the two real
+composites the backfill above already produced. **Always labeled "implied," never presented as an
+observed price** — same discipline as chart 5's "estimated cost basis" (plan §7.3: never "MVRV").
+
+Wired via the registry's existing `depends_on` mechanism (`materializeGold` already exposes each
+dependency's materialized gold output as a queryable view of the same name — no new machinery
+needed, just `depends_on: [price_composite_usd, reference_btc_usd]` and a `JOIN`). **This retires
+`pipeline:cross-rate-check`'s original purpose**: it used to compare an independently-sourced
+TAO/BTC price against the implied `TAO/USD ÷ BTC/USD` ratio and flag a real divergence between
+them; now `price_composite_btc` *is* that ratio by construction, so the check can never find
+anything to flag again, for any input — `crossRateCheck.query.test.ts` was rewritten to assert
+exactly that (the derivation is correct, and divergence detection is now a structural no-op) rather
+than the old "flags a planted 5% drift" behavior, which is no longer producible now that there's no
+more independent value to drift from the implied one. `volumeAndBtcComposite.query.test.ts`'s
+`price_composite_btc` case was also rewritten — it used to seed raw `TAOBTC` OHLCV rows directly;
+now it stands up `price_composite_usd`/`reference_btc_usd` as fixture views, matching how
+`depends_on` actually wires a metric to its dependencies.
+
+**Not yet done**: the web chart itself (`packages/web/components/PriceChart.tsx` and friends) still
+needs an "implied" label surfaced wherever chart 2 renders, so a viewer never mistakes it for an
+observed market price — left alone here since those files are mid-edit in an unrelated, already
+in-progress change.
 
 `pnpm test` runs the full suite (unit, query, contract, golden-file — see plan §5).
 
@@ -210,7 +479,35 @@ fixture-backed tests (`packages/pipeline/test/reconcileBalances.test.ts`,
 The prerequisite is now met: silver covers the whole range, so `UP_TO_BLOCK=8929643` is correct.
 What's left is RPC budget and an honest estimate of the call count — this walks ~41 windows of
 216,000 blocks and re-verifies every earlier window on each invocation, against 505,493 distinct
-coldkeys, and has never been sized at that scale. Estimate the reads before spending budget.
+coldkeys, and has never been sized at that scale. Estimate the reads before spending budget:
+
+```
+pnpm chain:estimate-reconciliation-rpc    # UP_TO_BLOCK required, no RPC calls made
+```
+
+`packages/pipeline/src/scripts/estimateReconciliationRpc.ts` (logic in
+`packages/pipeline/src/chain/estimateReconciliationRpc.ts`, tested against a fixture in
+`estimateReconciliationRpc.query.test.ts`) mirrors `reconcileBalances`'s own touched/newly-touched
+accounting exactly, as a single DuckDB query over `silver/transfers.parquet` and
+`silver/balance_events.parquet` — no network access, no `BLOCKMACHINE_API_KEY` needed. It buckets
+every transfer leg and balance-event coldkey by which `CHECKPOINT_INTERVAL_BLOCKS` window its
+block falls in, then counts, per window, the touched coldkeys (one `state_getStorage` read each,
+every window they're touched in) and the newly-touched ones (a second read, but only the first
+window a coldkey is ever seen — `knownGoodBalances` carries it forward for free after that).
+
+**Run 2026-09-09 against the full range (`UP_TO_BLOCK=8929643`, default 216,000-block windows,
+41 complete windows):** 1,181,375 actual-balance reads + 492,669 baseline reads + 123 window-
+overhead calls (hash/runtime-version) = **1,674,167 total RPC calls**, i.e. **~1.67M RU at the
+~1 RU/call measured in §4.2** — about 8% of Pro's 20M monthly quota, nowhere near the backfill's
+~26.8M. Reconciliation is cheap relative to the backfill precisely because the same 505,493
+coldkeys keep recurring across the 41 windows rather than each window paying a fresh baseline read
+for all of them (492,669 total baseline reads vs. 505,493 distinct coldkeys — nearly 1:1, as
+expected since most coldkeys are touched for the first time somewhere and rarely again before
+that; the 1.18M actual reads are the real multiplier, averaging ~29K touched coldkeys per window
+but climbing well past that in the busier later windows). **Budget is not the blocker here** — this
+comfortably fits in a single month's Pro quota alongside room to spare; the earlier "size before
+spending" caution was warranted (it wasn't obvious a priori that 41 × 505K would stay this small)
+but the answer is a green light, not a further blocker.
 
 ### Sharded gold metrics (`shard_by`)
 

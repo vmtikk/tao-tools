@@ -6,70 +6,78 @@ import { TransferCountChart } from "../components/TransferCountChart";
 
 export default function HomePage() {
   const gold = loadGoldExport();
-  const usdSeries = gold.series.find((s) => s.metric === "price_composite_usd");
-  const btcSeries = gold.series.find((s) => s.metric === "price_composite_btc");
+  const usdSeries = gold.series.find((s) => s.metric === "price_composite_usd_daily");
+  const btcSeries = gold.series.find((s) => s.metric === "price_composite_btc_daily");
   const volumeSeries = gold.series.find((s) => s.metric === "volume_usd_daily");
-  const transferCountSeries = gold.series.find((s) => s.metric === "transfer_count_per_block");
+  const transferCountSeries = gold.series.find((s) => s.metric === "transfer_count_daily");
 
   return (
     <main>
       <h1>TAO Analytics</h1>
-      <p className="subtitle">Volume-weighted composite prices and trading volume, across every venue polled.</p>
+      <p className="subtitle">Volume-weighted composite prices across every venue polled; trading volume from Binance only (see caveat below).</p>
 
       <section className="chart-section">
         <h2>TAO / USD</h2>
         <p className="section-subtitle">
-          1-minute resolution.
+          Daily (last 1-minute composite value each UTC day).
           {usdSeries ? ` Metric v${usdSeries.version}.` : ""}
         </p>
         <div className="chart-card">
           <LiveUsdPriceChart points={usdSeries?.points ?? []} />
           <p className="caveat">
-            Composite across polled venues only (Kraken, Coinbase, and USDT-quoted Binance, Bybit,
-            OKX, MEXC, Gate — USDT treated as USD-equivalent) — undercounts vs. aggregators,
-            especially in early history (tao-analytics-plan.md §4.1).
+            Composite across polled venues only (Kraken, Coinbase, and USDT-quoted Binance, OKX,
+            MEXC — USDT treated as USD-equivalent) — undercounts vs. aggregators, especially in
+            early history (tao-analytics-plan.md §4.1).
           </p>
         </div>
       </section>
 
       <section className="chart-section">
-        <h2>TAO / BTC</h2>
+        <h2>TAO / BTC (implied)</h2>
         <p className="section-subtitle">
-          1-minute resolution.
+          Daily (last 1-minute value each UTC day).
           {btcSeries ? ` Metric v${btcSeries.version}.` : ""}
         </p>
         <div className="chart-card">
-          <PriceChart points={btcSeries?.points ?? []} unit="btc" ariaLabel="TAO/BTC composite price line chart" />
-          <p className="caveat">Composite across Kraken and Upbit only.</p>
+          <PriceChart points={btcSeries?.points ?? []} unit="btc" ariaLabel="TAO/BTC implied price line chart" />
+          <p className="caveat">
+            <strong>Implied, not an observed market price</strong> — no exchange lists a real,
+            continuously-tradable TAO/BTC pair. Computed as TAO/USD ÷ BTC/USD, the same way a
+            trader would price an illiquid cross by routing through a common quote currency
+            (tao-analytics-plan.md §4.1).
+          </p>
         </div>
       </section>
 
       <section className="chart-section">
         <h2>Trading volume (USD)</h2>
         <p className="section-subtitle">
-          Daily, across USD/USDT venues.
+          Daily, in USD. Binance only.
           {volumeSeries ? ` Metric v${volumeSeries.version}.` : ""}
         </p>
         <div className="chart-card">
           <VolumeChart points={volumeSeries?.points ?? []} />
           <p className="caveat">
-            Sums only the venues this pipeline polls — undercounts vs. aggregators that see every
-            venue (tao-analytics-plan.md §4.1).
+            <strong>Binance only, deliberately</strong> — other polled venues (Coinbase, OKX, MEXC)
+            only started trading TAO much later than Binance, so summing them in would make the
+            series jump every time a new venue came online rather than reflecting real activity
+            change. Undercounts vs. aggregators, but every point is comparable to every other
+            (tao-analytics-plan.md §4.1).
           </p>
         </div>
       </section>
 
       <section className="chart-section">
-        <h2>Transfer count per block</h2>
+        <h2>Daily transfer count</h2>
         <p className="section-subtitle">
-          Phase 2.1 tracer bullet: blocks 1-1000 from genesis, decoded from raw chain events.
+          Daily, decoded from raw chain events, over whatever block range is currently backfilled.
           {transferCountSeries ? ` Metric v${transferCountSeries.version}.` : ""}
         </p>
         <div className="chart-card">
           <TransferCountChart points={transferCountSeries?.points ?? []} />
           <p className="caveat">
-            Proves the chain decode path end to end (bronze -&gt; silver -&gt; gold), not a
-            representative activity chart — this window is the chain&apos;s first ~3 hours.
+            Covers whatever prefix of chain history <code>chain:backfill</code> has reached so far,
+            not necessarily the full history to date (tao-analytics-plan.md §6).
           </p>
         </div>
       </section>

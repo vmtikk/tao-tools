@@ -7,14 +7,16 @@
 # mechanism, not a convention to remember.
 
 - name: price_composite_usd
-  version: 2
+  version: 3
   definition: >
     Volume-weighted composite TAO/USD close price per 1-minute bucket, across
     every USD- and USDT-quoted venue present in silver.ohlcv_1m (USDT is
     treated as USD-equivalent per §4.1). A bucket with zero quote volume on
-    every venue is excluded, not weighted as zero.
+    every venue is excluded, not weighted as zero. INTERNAL — not shipped in
+    gold.json; see price_composite_usd_daily for the chart.
   params: {}
   depends_on: []
+  export: false
   sql: >
     SELECT
       timestamp_ms,
@@ -26,34 +28,136 @@
   changelog:
     - v1: initial, Kraken-only (Phase 0)
     - v2: widened to every USD/USDT venue (Phase 1.1); USDT pairs folded into the USD composite
+    - v3: "stopped shipping in gold.json (export: false). Found 2026-09-10: once real backfill history landed, this metric alone produced 1,268,539 points — a 960px chart plotting an SVG path with one command per point, plus a linear hover-scan over all of them, plus (if toggled) a table with 1.27M rows. gold.json hit 248MB. Kept materializing internally (still needed for price_composite_btc's join and any future per-minute join, e.g. Phase 4 cost basis) — see price_composite_usd_daily, the new chart-facing metric."
 
-- name: price_composite_btc
+- name: price_composite_usd_daily
   version: 1
   definition: >
-    Volume-weighted composite TAO/BTC close price per 1-minute bucket, across
-    every venue quoting TAO/BTC in silver.ohlcv_1m. Same composite function
-    as price_composite_usd, evaluated over the BTC-quoted pair instead.
+    Daily close of price_composite_usd — the last 1-minute composite value
+    observed each UTC day. What the TAO/USD chart actually renders; the
+    1-minute series stays internal (see price_composite_usd's v3 changelog).
+    At most ~1,000 points for the full history so far, matching a chart's
+    actual pixel width instead of a 1.27M-point SVG path.
   params: {}
-  depends_on: []
+  depends_on: [price_composite_usd]
   sql: >
     SELECT
-      timestamp_ms,
-      SUM(close * quote_volume) / SUM(quote_volume) AS value
-    FROM silver_ohlcv_1m
-    WHERE quote_volume > 0 AND pair = 'TAOBTC'
-    GROUP BY timestamp_ms
-    ORDER BY timestamp_ms
+      (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
+      arg_max(value, timestamp_ms) AS value
+    FROM price_composite_usd
+    GROUP BY 1
+    ORDER BY 1
   changelog:
-    - v1: initial (Phase 1.3)
+    - v1: "initial (2026-09-10) — see price_composite_usd's v3 changelog for why"
 
-- name: reference_btc_usd
+- name: price_composite_usd_weekly
   version: 1
   definition: >
-    Kraken BTC/USD close price per 1-minute bucket. Not a chart — this is the
-    BTC/USD leg the cross-rate sanity check (§4.1) uses to verify
-    price_composite_usd ÷ reference_btc_usd tracks price_composite_btc.
-    Single venue is acceptable for a reference input; it isn't a composite
-    that ships to users.
+    Weekly close of price_composite_usd_daily — the last daily close observed
+    in each Monday-aligned UTC week. Bucketed with pure integer arithmetic
+    anchored to a known Monday
+    (`((timestamp_ms + 3 days) // 7 days) * 7 days - 3 days`), not DuckDB's
+    date_trunc('week', ...) — found for real (2026-09-10) that date_trunc
+    truncates in the DuckDB session's *local* timezone, not UTC (it defaults
+    to the machine's system timezone unless explicitly overridden), which
+    would silently shift week boundaries depending on where materializeGold
+    runs. Built from the daily rollup, not the raw 1-minute composite —
+    cheaper, and taking the last day's close within a week is the same value
+    either way. For a viewer who only cares about days/weeks (not 1-minute or
+    hourly detail), the same 883 daily points already render weekly trends
+    visually with no extra work; this exists for a UI that wants fewer,
+    explicitly-weekly points instead.
+  params: {}
+  depends_on: [price_composite_usd_daily]
+  sql: >
+    SELECT
+      (((timestamp_ms + 259200000) // 604800000) * 604800000) - 259200000 AS timestamp_ms,
+      arg_max(value, timestamp_ms) AS value
+    FROM price_composite_usd_daily
+    GROUP BY 1
+    ORDER BY 1
+  changelog:
+    - v1: "initial (2026-09-10), alongside price_composite_btc_weekly — requested for a days/weeks-focused view now that 1-minute/hourly resolution is confirmed unnecessary"
+
+- name: price_composite_btc
+  version: 3
+  definition: >
+    IMPLIED TAO/BTC price per 1-minute bucket — price_composite_usd ÷
+    reference_btc_usd, not a directly-traded market price. No exchange lists
+    a real, continuously-tradable TAO/BTC pair (confirmed 2026-09-10: Kraken's
+    market list has no TAO/BTC symbol at all; Upbit returns zero candles even
+    for a recent `since`, no error). This is a synthetic cross rate
+    constructed from two already-real composites, the same way a trader would
+    price an illiquid cross by routing through a common quote currency.
+    Always label this "implied" wherever it's shown — never present it as an
+    observed price (same labeling discipline as chart 5's "estimated cost
+    basis," never "MVRV" — plan §7.3). INTERNAL — not shipped in gold.json;
+    see price_composite_btc_daily for the chart.
+  params: {}
+  depends_on: [price_composite_usd, reference_btc_usd]
+  export: false
+  sql: >
+    SELECT
+      price_composite_usd.timestamp_ms,
+      price_composite_usd.value / reference_btc_usd.value AS value
+    FROM price_composite_usd
+    JOIN reference_btc_usd ON reference_btc_usd.timestamp_ms = price_composite_usd.timestamp_ms
+    WHERE reference_btc_usd.value != 0
+    ORDER BY price_composite_usd.timestamp_ms
+  changelog:
+    - v1: "initial (Phase 1.3) — direct composite across Kraken and Upbit's TAO/BTC markets"
+    - v2: "redefined as an implied cross-rate (price_composite_usd / reference_btc_usd). Found 2026-09-10, after a real venue investigation: no reputable exchange lists a real TAO/BTC pair at all (Kraken has no such market; Upbit returns zero candles) — BTC_VENUES (ingest/exchanges/venues.ts) is empty and expected to stay that way. This also retires pipeline:cross-rate-check's original purpose: it compared price_composite_btc against price_composite_usd/reference_btc_usd as an independent check, and those are now the same value by construction, so the check can no longer flag anything — see crossRateCheck.query.test.ts's updated comment."
+    - v3: "stopped shipping in gold.json (export: false), same reason and same day as price_composite_usd's v3 — this metric mirrors price_composite_usd's row count exactly (it's a join against it), so it was equally oversized. See price_composite_btc_daily."
+
+- name: price_composite_btc_daily
+  version: 1
+  definition: >
+    Daily close of price_composite_btc — the last 1-minute implied TAO/BTC
+    value observed each UTC day. What the TAO/BTC chart actually renders (see
+    price_composite_btc's definition for the "implied, not observed"
+    labeling requirement — it applies here too).
+  params: {}
+  depends_on: [price_composite_btc]
+  sql: >
+    SELECT
+      (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
+      arg_max(value, timestamp_ms) AS value
+    FROM price_composite_btc
+    GROUP BY 1
+    ORDER BY 1
+  changelog:
+    - v1: "initial (2026-09-10) — see price_composite_btc's v3 changelog for why"
+
+- name: price_composite_btc_weekly
+  version: 1
+  definition: >
+    Weekly close of price_composite_btc_daily — the last daily implied
+    TAO/BTC value observed in each Monday-aligned UTC week, bucketed with the
+    same timezone-independent integer arithmetic as price_composite_usd_weekly
+    (see its definition for why — DuckDB's date_trunc('week', ...) truncates
+    in the session's local timezone, not UTC). price_composite_btc's
+    "implied, not observed" labeling requirement applies here too.
+  params: {}
+  depends_on: [price_composite_btc_daily]
+  sql: >
+    SELECT
+      (((timestamp_ms + 259200000) // 604800000) * 604800000) - 259200000 AS timestamp_ms,
+      arg_max(value, timestamp_ms) AS value
+    FROM price_composite_btc_daily
+    GROUP BY 1
+    ORDER BY 1
+  changelog:
+    - v1: "initial (2026-09-10), alongside price_composite_usd_weekly"
+
+- name: reference_btc_usd
+  version: 2
+  definition: >
+    Volume-weighted composite BTC/USD close price per 1-minute bucket, across
+    every BTC/USD- and BTC/USDT-quoted reference venue present in
+    silver.ohlcv_1m (USDT treated as USD-equivalent, same as
+    price_composite_usd). Not a chart — this is the BTC/USD leg the
+    cross-rate sanity check (§4.1) uses to verify price_composite_usd ÷
+    reference_btc_usd tracks price_composite_btc.
   params: {}
   depends_on: []
   export: false
@@ -62,20 +166,28 @@
       timestamp_ms,
       SUM(close * quote_volume) / SUM(quote_volume) AS value
     FROM silver_ohlcv_1m
-    WHERE quote_volume > 0 AND pair = 'BTCUSD'
+    WHERE quote_volume > 0 AND pair IN ('BTCUSD', 'BTCUSDT')
     GROUP BY timestamp_ms
     ORDER BY timestamp_ms
   changelog:
-    - v1: initial (Phase 1.3)
+    - v1: "initial (Phase 1.3), Kraken BTC/USD only"
+    - v2: "widened to BTCUSDT (Binance) — found 2026-09-10 that Kraken's BTC/USD, like its TAO pairs, only serves a live-tail window via its public OHLC endpoint (no real 2023-onward history); Binance's BTC/USDT has full deep history, same as its TAO/USDT. Kraken is kept too — its thin recent data doesn't hurt anything."
 
 - name: volume_usd_daily
-  version: 1
+  version: 2
   definition: >
-    Total quote volume in USD, summed per UTC day, across every USD- and
-    USDT-quoted venue present in silver.ohlcv_1m. Undercounts versus
-    aggregators — this only sums venues actually polled (§4.1), which is why
-    the chart renders the caveat alongside the series rather than relying on
-    this definition string alone.
+    Binance TAO/USDT quote volume in USD, summed per UTC day.
+    Binance-only, deliberately — not a composite across every polled venue.
+    Found real (2026-09-10): venues came online at very different points
+    (Binance 2024-04, Coinbase 2025-03, OKX 2026-06, MEXC 2026-08, Kraken
+    live-tail-only), so a multi-venue sum jumps every time a new venue's
+    history starts, not because trading activity actually changed — a day
+    with 1 contributing venue sits right next to a day with 4, making the
+    series internally incomparable across time. Binance is the only venue
+    with volume for the whole window, so restricting to it trades completeness
+    (misses real volume on Coinbase/OKX/MEXC once they're live) for a series
+    that's actually comparable day to day — undercounting consistently is
+    more useful here than a total that means something different every year.
   params: {}
   depends_on: []
   sql: >
@@ -83,32 +195,31 @@
       (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
       SUM(quote_volume) AS value
     FROM silver_ohlcv_1m
-    WHERE quote_volume > 0 AND pair IN ('TAOUSD', 'TAOUSDT')
+    WHERE quote_volume > 0 AND exchange = 'binance' AND pair = 'TAOUSDT'
     GROUP BY 1
     ORDER BY 1
   changelog:
     - v1: initial (Phase 1.4)
+    - v2: "restricted to Binance only (was: summed across every USD/USDT venue present). Found 2026-09-10: with real backfill history in place, venues started at very different dates, so the multi-venue sum jumped every time a new venue's history began — not a real activity change, just more venues contributing. Binance has continuous history back to 2024-04-11 (the earliest any venue has TAO data at all), so restricting to it makes every point in the series comparable to every other, at the cost of undercounting once Coinbase/OKX/MEXC are also trading."
 
-- name: transfer_count_per_block
-  version: 1
+- name: transfer_count_daily
+  version: 2
   definition: >
-    Count of Balances.Transfer events per block, over whatever block range is
-    currently in silver.transfers (Phase 2.1 tracer bullet: blocks 1-1000 from
-    genesis). x-axis is each block's on-chain timestamp (Timestamp.Now,
-    captured alongside System.Events in bronze — §10), not wall-clock
-    ingestion time. Requires chain bronze; absent in a Phase 1-only
+    Count of Balances.Transfer events per UTC day, over whatever block range is
+    currently in silver.transfers. Requires chain bronze; absent in a Phase 1-only
     environment (see materializeGold's guard on silver_transfers).
   params: {}
   depends_on: []
   sql: >
     SELECT
-      timestamp_ms,
+      (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
       COUNT(*) AS value
     FROM silver_transfers
-    GROUP BY timestamp_ms
-    ORDER BY timestamp_ms
+    GROUP BY 1
+    ORDER BY 1
   changelog:
-    - v1: initial (Phase 2.1)
+    - v1: "initial (Phase 2.1) as transfer_count_per_block, one point per exact block timestamp — fine for the ~1,000-block Phase 2.1 tracer bullet, but found for real (2026-09-05) to produce 1.3M points against the real ~5.8M-block backfill prefix, which a browser cannot render (1.3M SVG bars) or even receive quickly (~200MB page, ~40s load)"
+    - v2: "renamed to transfer_count_daily and rebucketed to UTC days, matching every other time-series metric in this registry (volume_usd_daily, account_balances_daily, wallet_count_*, exchange_balances_daily) — per-block resolution was never meaningful past a few thousand blocks anyway, since a chart can only show as many distinct columns as it has pixels"
 
 - name: account_balances_daily
   version: 2

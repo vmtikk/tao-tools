@@ -40,7 +40,7 @@ describe("gold.json golden file", () => {
   /**
    * Writes silver/transfers.parquet directly, skipping bronze and the SCALE
    * decode step (that path is covered by decodeEvents' own tests) — this
-   * test is about registry/materialize wiring, and `transfer_count_per_block`
+   * test is about registry/materialize wiring, and `transfer_count_daily`
    * is now part of the real registry every `materializeGold(REGISTRY_PATH)`
    * call here exercises, so it needs *some* silver_transfers input to not
    * fail on a missing view.

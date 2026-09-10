@@ -6,12 +6,23 @@ import { withDuckDb } from "../src/duckdb/session.js";
 import { materializeSilverOhlcv } from "../src/silver/materializeOhlcv.js";
 import { materializeGold } from "../src/gold/materialize.js";
 import { runCrossRateCheck } from "../src/crossRate/runCheck.js";
+import { goldDir } from "../src/paths.js";
 
 /**
- * Integration test for the Phase 1.3 scheduled assertion (§4.1, §6): runs
- * the real bronze -> silver -> gold path against a fixture with a clean
- * bucket and a planted 5%+ drift, and asserts the check only flags the
- * planted one.
+ * Integration test for the Phase 1.3 scheduled assertion (§4.1, §6).
+ *
+ * `price_composite_btc` was redefined 2026-09-10 (registry v2) from a direct
+ * composite over a real `TAOBTC` market pair to an *implied* cross-rate —
+ * `price_composite_usd ÷ reference_btc_usd` — because no reputable exchange
+ * turned out to list a real TAO/BTC pair at all (see the registry's
+ * changelog). That retires this check's original purpose: it used to compare
+ * an independently-observed TAO/BTC price against the implied ratio and flag
+ * a real divergence between them; now `price_composite_btc` *is* that ratio
+ * by construction, so `checkCrossRateDivergence` can never find anything to
+ * flag, for any input. This test locks in both halves of that new reality —
+ * the derivation is correct, and divergence detection is now a structural
+ * no-op — rather than the old "flags a planted drift" behavior, which is no
+ * longer possible to produce (there's no more independent value to drift).
  */
 describe("runCrossRateCheck (integration)", () => {
   const REGISTRY_PATH = join(import.meta.dirname, "..", "..", "..", "data", "meta", "metrics_registry.yaml");
@@ -34,7 +45,7 @@ describe("runCrossRateCheck (integration)", () => {
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  it("flags only the bucket with a planted cross-rate drift", async () => {
+  it("derives price_composite_btc as the implied ratio, so the check reports no divergences", async () => {
     const writeBronze = async (pair: string, rows: string) => {
       const dir = join(tempRoot, "data", "bronze", "prices", "kraken", pair);
       mkdirSync(dir, { recursive: true });
@@ -52,27 +63,24 @@ describe("runCrossRateCheck (integration)", () => {
       });
     };
 
-    // t=1000: implied 500/50000 = 0.01, matches observed TAO/BTC of 0.01 — clean.
-    // t=2000: implied 500/50000 = 0.01, but observed TAO/BTC is 0.02 — planted drift.
+    // t=1000: TAO/USD=500, BTC/USD=50000 -> implied TAO/BTC = 0.01.
+    // t=2000: TAO/USD=750, BTC/USD=50000 -> implied TAO/BTC = 0.015.
+    // No TAOBTC bronze written at all — price_composite_btc no longer reads
+    // that pair; it's entirely derived from these two USD-denominated series.
     await writeBronze(
       "TAOUSD",
       `('kraken', 'TAOUSD', 1000, 500, 500, 500, 500, 1, 100, false),
-       ('kraken', 'TAOUSD', 2000, 500, 500, 500, 500, 1, 100, false)`,
+       ('kraken', 'TAOUSD', 2000, 750, 750, 750, 750, 1, 100, false)`,
     );
     await writeBronze(
       "BTCUSD",
       `('kraken', 'BTCUSD', 1000, 50000, 50000, 50000, 50000, 1, 100, false),
        ('kraken', 'BTCUSD', 2000, 50000, 50000, 50000, 50000, 1, 100, false)`,
     );
-    await writeBronze(
-      "TAOBTC",
-      `('kraken', 'TAOBTC', 1000, 0.01, 0.01, 0.01, 0.01, 1, 100, false),
-       ('kraken', 'TAOBTC', 2000, 0.02, 0.02, 0.02, 0.02, 1, 100, false)`,
-    );
 
     await materializeSilverOhlcv();
     // materializeGold now runs every registry entry, including
-    // transfer_count_per_block — this test only exercises the price/BTC
+    // transfer_count_daily — this test only exercises the price/BTC
     // path, so an empty-but-correctly-shaped transfers.parquet is enough to
     // not fail on a missing silver_transfers view.
     await withDuckDb(async (connection) => {
@@ -90,9 +98,19 @@ describe("runCrossRateCheck (integration)", () => {
     });
     await materializeGold(REGISTRY_PATH);
 
+    const impliedRows = await withDuckDb(async (connection) => {
+      const result = await connection.run(
+        `SELECT timestamp_ms, value FROM read_parquet('${join(goldDir(), "price_composite_btc.parquet").replace(/\\/g, "/")}') ORDER BY timestamp_ms;`,
+      );
+      return result.getRows();
+    });
+    expect(impliedRows.map((r) => [Number(r[0]), Number(r[1])])).toEqual([
+      [1000, 0.01],
+      [2000, 0.015],
+    ]);
+
+    // Tautological now by construction — see the describe block's comment.
     const { divergences } = await runCrossRateCheck();
-    expect(divergences).toHaveLength(1);
-    expect(divergences[0]).toMatchObject({ timestampMs: 2000, observedTaoBtc: 0.02 });
-    expect(divergences[0]!.divergence).toBeGreaterThan(0.05);
+    expect(divergences).toEqual([]);
   });
 });
