@@ -655,8 +655,11 @@ silver in a Phase-1-only environment). Gold metric `social_trends_bittensor_week
 just filters to the one keyword and ships in `gold.json` — confirmed end-to-end 2026-09-10: 127
 real points flowing through export.
 
-Neither source is wired into any scheduler yet — same gap as the `chain:*` scripts, run manually.
-No chart renders either series yet (the overlay-on-price-chart UI hasn't been built).
+Both sources now have a systemd-timer-driven continuous sync for an
+always-on server (`sync-youtube.sh`/`sync-trends.sh`, once a day each — see
+"Continuous bronze sync" below); locally, run `youtube:snapshot-channels`/
+`trends:backfill` by hand as before. No chart renders either series yet
+(the overlay-on-price-chart UI hasn't been built).
 
 ## Going from local to real infra
 
@@ -686,15 +689,36 @@ purely via `.env` — DuckDB `COPY` writes identically either way, no code chang
 
 ## Continuous bronze sync (Hetzner / any always-on Ubuntu server)
 
-[`sync-bronze.sh`](sync-bronze.sh) is the incremental counterpart to the
-one-shot genesis backfill above, and *only* that — it repeats `chain:backfill`
-with no `TO_BLOCK`, so every run resolves a fresh chain head and catches up
-from wherever the previous run's checkpoint left off. Nothing else: it
-doesn't touch prices, doesn't decode anything, doesn't produce chart data.
+Three independent sync scripts, one per bronze source, each with its own
+systemd timer — deliberately separate rather than one combined job, so a
+failure or rate-limit in one (Trends' unofficial API is the flakiest by far)
+can never block the other two:
+
+- [`sync-bronze.sh`](sync-bronze.sh) — chain. Incremental counterpart to the
+  one-shot genesis backfill above: repeats `chain:backfill` with no
+  `TO_BLOCK`, so every run resolves a fresh chain head and catches up from
+  wherever the previous run's checkpoint left off. Runs every 15 minutes
+  (`deploy/tao-sync.timer`) — chain activity is continuous, so this is the
+  one source worth polling frequently.
+- [`sync-youtube.sh`](sync-youtube.sh) — YouTube channel stats. One
+  `channels.list` call (1 quota unit total) per run, writes today's
+  cumulative view/sub/video counts. Stateless (no checkpoint — each run just
+  overwrites today's bronze file), runs once a day
+  (`deploy/tao-sync-youtube.timer`, 00:10 UTC) since the data has real daily
+  granularity and more frequent polling buys nothing.
+- [`sync-trends.sh`](sync-trends.sh) — Google Trends. Re-fetches the entire
+  configured date range every run (this is correct, not wasteful — Trends
+  has no "just the new points" endpoint and renormalizes its whole 0-100
+  scale against the query's current end date regardless). Also stateless,
+  also once a day (`deploy/tao-sync-trends.timer`, 00:30 UTC, offset from
+  YouTube's run purely so they don't both hit the network at the same
+  instant — no shared state, so this isn't a correctness requirement).
+
+None of the three touch prices, decode anything, or produce chart data.
 `chain:materialize-silver`/`pipeline:materialize`/`pipeline:export` (bronze
 -> the tables the charts read) are a separate, unrelated step — run those
 wherever/whenever you want fresh charts; they just read the same R2 bucket
-this keeps topped up.
+these three keep topped up.
 
 Because of that narrow scope, the server only needs `packages/core` +
 `packages/ingest` — not `packages/pipeline` (ingest never depends on it,
@@ -702,7 +726,9 @@ only the reverse) and not `packages/web`. Code reaches the server via a git
 sparse checkout (against a private GitHub remote — this repo doesn't have
 one yet, push it once: `git remote add origin <url> && git push -u origin
 master`); the small amount of local-only state that isn't in git (secrets,
-the backfill checkpoint) goes over via `deploy/push-state.sh`.
+the chain backfill checkpoint) goes over via `deploy/push-state.sh`. YouTube
+and Trends need no equivalent checkpoint file — both scripts are stateless,
+so pushing `.env` (for `YOUTUBE_API_KEY`) is the only prerequisite they add.
 
 One-time setup, on the server:
 
@@ -726,28 +752,36 @@ would start `chain:backfill` over from block 1 instead of resuming. **Never
 run `sync-bronze.sh` on the server at the same time as a manual
 `chain:backfill` here** — both read/write that same checkpoint file.
 
-Back on the server, build and start the timer:
+Back on the server, build and start all three timers:
 
 ```
 cd /opt/tao-tools
 pnpm install --filter @tao-tools/ingest... && pnpm --filter @tao-tools/ingest... run build
-./sync-bronze.sh   # run once by hand to confirm it works end to end
-sudo cp deploy/tao-sync.service deploy/tao-sync.timer /etc/systemd/system/
+./sync-bronze.sh    # run each once by hand to confirm it works end to end
+./sync-youtube.sh
+./sync-trends.sh
+sudo cp deploy/tao-sync.service deploy/tao-sync.timer \
+        deploy/tao-sync-youtube.service deploy/tao-sync-youtube.timer \
+        deploy/tao-sync-trends.service deploy/tao-sync-trends.timer \
+        /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tao-sync.timer
+sudo systemctl enable --now tao-sync.timer tao-sync-youtube.timer tao-sync-trends.timer
 ```
 
 Future code changes to `packages/core`/`packages/ingest`: push from here as
 usual (`git push`), then on the server run
 [`deploy/update.sh`](deploy/update.sh) (`git pull` + rebuild, scoped to the
-same two packages).
+same two packages) — one rebuild covers all three sync scripts.
 
-Follow logs live: `journalctl -u tao-sync -f`. Check schedule/last run:
-`systemctl list-timers tao-sync.timer` / `systemctl status tao-sync.service`.
-`OnUnitActiveSec=15min` in the timer is relative to the previous run
-*finishing*, so a slow catch-up (e.g. after downtime) just delays the next
-run instead of overlapping it; `sync-bronze.sh` also takes its own `flock` in
-case it's ever invoked manually while the timer's run is still going.
+Follow logs live: `journalctl -u tao-sync -f` / `-u tao-sync-youtube -f` /
+`-u tao-sync-trends -f`. Check schedule/last run: `systemctl list-timers` (no
+argument lists all three) or `systemctl status <unit>`. `tao-sync.timer`'s
+`OnUnitActiveSec=15min` is relative to the previous run *finishing*, so a
+slow catch-up (e.g. after downtime) just delays the next run instead of
+overlapping it; the YouTube/Trends timers use `OnCalendar` instead (once a
+day, see their own files for why) since that data doesn't need — or benefit
+from — polling every 15 minutes. All three scripts take their own `flock` in
+case one is ever invoked manually while its timer's run is still going.
 
 ## Repo layout
 

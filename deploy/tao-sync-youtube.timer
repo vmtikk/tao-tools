@@ -1,0 +1,17 @@
+[Unit]
+Description=Run tao-tools YouTube channel-stats sync once a day
+
+[Timer]
+# Calendar-based, not OnUnitActiveSec like tao-sync.timer's 15-minute chain
+# poll: this data has real daily granularity (one bronze row per channel per
+# day), so one consistent time of day keeps future day-over-day deltas
+# evenly spaced instead of drifting with however long each run happens to
+# take. Time is UTC (systemd default unless the server's local timezone is
+# set otherwise) — pick any time; it just needs to be consistent.
+OnCalendar=*-*-* 00:10:00
+RandomizedDelaySec=5min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

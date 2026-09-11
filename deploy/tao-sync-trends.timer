@@ -1,0 +1,15 @@
+[Unit]
+Description=Run tao-tools Google Trends sync once a day
+
+[Timer]
+# Same calendar-based reasoning as tao-sync-youtube.timer. Offset 20 minutes
+# from the YouTube sync (00:10) purely so the two don't both hit the network
+# in the same instant — they don't share any state or lock, so it's not a
+# correctness requirement, just tidiness.
+OnCalendar=*-*-* 00:30:00
+RandomizedDelaySec=5min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
