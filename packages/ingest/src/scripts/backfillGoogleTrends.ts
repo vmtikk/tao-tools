@@ -24,8 +24,13 @@ async function main(): Promise<void> {
 
   for (const keyword of TRENDS_KEYWORDS) {
     const points = await withRetry(() => fetchGoogleTrends(keyword, START_DATE, new Date()), {
-      maxAttempts: 4,
-      baseDelayMs: 3000,
+      // Google's 429s on the unofficial API lift on the order of minutes,
+      // not seconds — retry fast and you hammer a warm ban (observed 2026-09-12:
+      // 3s/6s/12s backoff burned all 4 attempts in 24s while still 429).
+      maxAttempts: 6,
+      baseDelayMs: 60_000,
+      factor: 2,
+      maxDelayMs: 5 * 60_000,
       onRetry: (attempt, delayMs, err) =>
         console.error(`  retry ${attempt} for "${keyword}" after ${delayMs}ms: ${(err as Error).message}`),
     });

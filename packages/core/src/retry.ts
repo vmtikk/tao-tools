@@ -4,6 +4,8 @@ export interface RetryOptions {
   baseDelayMs?: number;
   /** Multiplier applied per subsequent attempt. Default 2 (exponential). */
   factor?: number;
+  /** Cap on per-attempt delay in ms. Useful when the base delay is large. */
+  maxDelayMs?: number;
   /** Injectable so callers can fast-forward in tests instead of sleeping. */
   sleep?: (ms: number) => Promise<void>;
   /** Called before each retry with the attempt number (1-based) and delay. */
@@ -22,7 +24,7 @@ function defaultSleep(ms: number): Promise<void> {
  * the last error once attempts are exhausted.
  */
 export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
-  const { maxAttempts = 5, baseDelayMs = 500, factor = 2, sleep = defaultSleep, onRetry } = opts;
+  const { maxAttempts = 5, baseDelayMs = 500, factor = 2, maxDelayMs, sleep = defaultSleep, onRetry } = opts;
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -31,7 +33,8 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}
     } catch (err) {
       lastError = err;
       if (attempt === maxAttempts) break;
-      const delayMs = baseDelayMs * factor ** (attempt - 1);
+      let delayMs = baseDelayMs * factor ** (attempt - 1);
+      if (maxDelayMs !== undefined) delayMs = Math.min(delayMs, maxDelayMs);
       onRetry?.(attempt, delayMs, err);
       await sleep(delayMs);
     }

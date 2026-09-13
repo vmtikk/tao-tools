@@ -12,6 +12,20 @@ function formatDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Raised when Google returns 429 — rate limiting that lifting requires
+ * minutes, not the seconds the generic retry budget assumes, so callers
+ * should back off much longer for this. */
+export class GoogleTrendsRateLimitError extends Error {
+  constructor(status: number, endpoint: string) {
+    super(`Google Trends ${endpoint} rate-limited (HTTP ${status})`);
+    this.name = "GoogleTrendsRateLimitError";
+  }
+}
+
 class CookieJar {
   private readonly byName = new Map<string, string>();
 
@@ -77,6 +91,9 @@ export async function fetchGoogleTrends(keyword: string, startDate: Date, endDat
 
   const homeResponse = await fetch(exploreUiUrl, { headers: { "User-Agent": USER_AGENT } });
   jar.absorb(homeResponse);
+  // This leg's own status is routinely 429 (see header note) — but give the
+  // API a beat before hitting it; hammering a warm 429 makes it stick.
+  await sleep(1000);
 
   const exploreReq = {
     comparisonItem: [{ keyword, geo: "", time: `${formatDate(startDate)} ${formatDate(endDate)}` }],
@@ -89,6 +106,7 @@ export async function fetchGoogleTrends(keyword: string, startDate: Date, endDat
   });
   jar.absorb(exploreResponse);
   if (!exploreResponse.ok) {
+    if (exploreResponse.status === 429) throw new GoogleTrendsRateLimitError(429, "explore");
     throw new Error(`Google Trends explore failed: HTTP ${exploreResponse.status}`);
   }
   const exploreBody = JSON.parse(stripJsonSafetyPrefix(await exploreResponse.text())) as { widgets: ExploreWidget[] };
@@ -104,6 +122,7 @@ export async function fetchGoogleTrends(keyword: string, startDate: Date, endDat
     headers: { "User-Agent": USER_AGENT, Cookie: jar.header(), Referer: exploreUiUrl },
   });
   if (!multilineResponse.ok) {
+    if (multilineResponse.status === 429) throw new GoogleTrendsRateLimitError(429, "widgetdata");
     throw new Error(`Google Trends widgetdata failed: HTTP ${multilineResponse.status}`);
   }
   const multilineBody = JSON.parse(stripJsonSafetyPrefix(await multilineResponse.text())) as {
