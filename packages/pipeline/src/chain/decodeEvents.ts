@@ -35,12 +35,16 @@ function numericCodecToBigInt(codec: unknown): bigint {
 }
 
 /**
- * Only `pallet_balances` `Transfer`/`Deposit`/`Withdraw` and pre-dTAO
- * `SubtensorModule` `StakeAdded`/`StakeRemoved` are extracted — every other
- * event (every other pallet, plus the dTAO-era 6-field stake shape) passes
- * through bronze untouched and gets decoded later, when a phase needs it
- * (§10: "Store the entire System.Events blob per block, unparsed hex...
- * Decode selectively at silver.").
+ * Only `pallet_balances` `Transfer`/`Deposit`/`Withdraw`/`DustLost` and
+ * pre-dTAO `SubtensorModule` `StakeAdded`/`StakeRemoved` are extracted —
+ * every other event (every other pallet, plus the dTAO-era 6-field stake
+ * shape) passes through bronze untouched and gets decoded later, when a
+ * phase needs it (§10: "Store the entire System.Events blob per block,
+ * unparsed hex... Decode selectively at silver.").
+ *
+ * `DustLost { account, amount }` has the same two-field shape as
+ * `Withdraw { who, amount }` — see `normalize.ts`'s doc comment for why it
+ * normalizes to a `withdraw` `BalanceEvent` rather than a new kind.
  */
 function toDecodedEvent(event: { section: string; method: string; data: unknown }): DecodedEvent | null {
   const section = event.section.toLowerCase();
@@ -51,7 +55,7 @@ function toDecodedEvent(event: { section: string; method: string; data: unknown 
       const [from, to, amount] = [data[0], data[1], data[2]];
       return { section, method: "Transfer", data: [String(from), String(to), numericCodecToBigInt(amount)] };
     }
-    if (event.method === "Deposit" || event.method === "Withdraw") {
+    if (event.method === "Deposit" || event.method === "Withdraw" || event.method === "DustLost") {
       const [who, amount] = [data[0], data[1]];
       return { section, method: event.method, data: [String(who), numericCodecToBigInt(amount)] };
     }

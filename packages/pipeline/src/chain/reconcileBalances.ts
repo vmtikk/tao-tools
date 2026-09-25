@@ -13,6 +13,7 @@ import { withDuckDb } from "../duckdb/session.js";
 import { resolveBronzeUri, silverDir } from "../paths.js";
 import { buildRegistry } from "./decodeEvents.js";
 import { decodeFreeBalance } from "./decodeAccount.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import type { TypeRegistry } from "@polkadot/types";
 
 function escapeSqlLiteral(value: string): string {
@@ -189,6 +190,20 @@ export async function reconcileBalances(opts: {
   /** Pre-loaded events, so a multi-checkpoint caller can load silver once
    * instead of once per checkpoint. Defaults to a fresh read from silver. */
   events?: readonly BalanceEvent[];
+  /**
+   * Coldkeys in flight at once for each of this function's two
+   * `state_getStorage`-per-coldkey passes (fresh baselines, then final
+   * balances). Default 1 preserves the original one-at-a-time behavior.
+   *
+   * Exists for the same reason `chain:backfill`'s `CHAIN_CONCURRENCY` does
+   * (see `fetchBlockRange.ts`): a sequential loop here is latency-bound at
+   * ~270ms/call RTT, not rate-limit-bound, so `CHAIN_MAX_RPM` alone can't
+   * make a real reconciliation run fast — measured to project to ~5 days of
+   * wall-clock time at concurrency 1 for the full genesis-to-head range's
+   * ~1.67M calls, versus ~4 hours at the backfill's own measured ~110-120
+   * calls/s ceiling.
+   */
+  concurrency?: number;
 }): Promise<ReconcileBalancesResult> {
   const allEvents = opts.events ?? (await loadEventsFromSilver());
   const windowEvents = allEvents.filter((e) => e.blockNumber >= opts.fromBlock && e.blockNumber <= opts.toBlock);
@@ -206,6 +221,7 @@ export async function reconcileBalances(opts: {
   }
 
   const client = opts.client;
+  const concurrency = opts.concurrency ?? 1;
   const startBlockHash = await client.call<string>("chain_getBlockHash", [opts.fromBlock - 1]);
   const endBlockHash = await client.call<string>("chain_getBlockHash", [opts.toBlock]);
   const registry = await loadRegistryForBlock(client, endBlockHash);
@@ -213,34 +229,32 @@ export async function reconcileBalances(opts: {
   // Only coldkeys touched here for the first time (not already carried
   // forward from a prior, validated checkpoint) need a real on-chain read.
   const newlyTouched = [...touchedColdkeys].filter((coldkey) => !knownGoodBalances.has(coldkey));
-  const freshBaseline = new Map<Coldkey, Rao>();
-  for (const coldkey of newlyTouched) {
+  const freshBaselineEntries = await mapWithConcurrency(newlyTouched, concurrency, async (coldkey) => {
     const key = systemAccountKey(coldkey);
     const hex = await client.call<string | null>("state_getStorage", [key, startBlockHash]);
-    freshBaseline.set(coldkey, asRao(decodeFreeBalance(registry, hex)));
-  }
+    return [coldkey, asRao(decodeFreeBalance(registry, hex))] as const;
+  });
 
   const initial = new Map<Coldkey, Rao>(knownGoodBalances);
-  for (const [coldkey, rao] of freshBaseline) {
+  for (const [coldkey, rao] of freshBaselineEntries) {
     initial.set(coldkey, rao);
   }
 
   const reconstructed = reconstructBalances(windowEvents, initial);
 
-  const rows: ReconciliationRow[] = [];
-  for (const coldkey of touchedColdkeys) {
+  const rows = await mapWithConcurrency([...touchedColdkeys], concurrency, async (coldkey): Promise<ReconciliationRow> => {
     const key = systemAccountKey(coldkey);
     const accountInfoHex = await client.call<string | null>("state_getStorage", [key, endBlockHash]);
     const actualRao = decodeFreeBalance(registry, accountInfoHex);
     const reconstructedRao = reconstructed.get(coldkey) ?? 0n;
-    rows.push({
+    return {
       coldkey,
       baselineRao: initial.get(coldkey) ?? 0n,
       reconstructedRao,
       actualRao,
       matches: reconstructedRao === actualRao,
-    });
-  }
+    };
+  });
 
   return {
     fromBlock: opts.fromBlock,

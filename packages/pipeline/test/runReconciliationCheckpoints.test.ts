@@ -135,4 +135,57 @@ describe("runReconciliationCheckpoints", () => {
     expect(checkpoints).toHaveLength(1);
     expect(checkpoints[0]!.mismatches.length).toBeGreaterThan(0);
   });
+
+  it("resumeFrom skips already-completed windows and reuses their carried-forward balances", async () => {
+    const events: BalanceEvent[] = [
+      transfer(50, ALICE, BOB, 100n), // window 1: [1,100]
+      transfer(150, BOB, CHARLIE, 40n), // window 2: [101,200]
+    ];
+    const client = fakeClientForColdkeys({
+      200: { [BOB]: 60n, [CHARLIE]: 40n },
+    });
+
+    // Simulate an earlier run having already completed window 1, carrying
+    // Bob's validated balance (100) forward instead of window 1 being redone.
+    const checkpoints = await runReconciliationCheckpoints({
+      client,
+      intervalBlocks: 100,
+      upToBlock: 200,
+      fromBlock: 1,
+      events,
+      resumeFrom: { windowStart: 101, knownGoodBalances: new Map([[BOB, asRao(100n)]]) },
+    });
+
+    // Only window 2 ran — window 1 never touched the client at all.
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]).toMatchObject({ fromBlock: 101, toBlock: 200 });
+    const hash0Reads = client.calls.filter(([, params]) => (params as [string, string])[1] === "0xhash0");
+    expect(hash0Reads).toEqual([]); // window 1's own baseline read, at block 0, never happened
+  });
+
+  it("calls onWindowComplete once per window, after that window's own result is available", async () => {
+    const events: BalanceEvent[] = [transfer(50, ALICE, BOB, 100n), transfer(150, BOB, CHARLIE, 40n)];
+    const client = fakeClientForColdkeys({
+      0: { [ALICE]: 100n },
+      100: { [ALICE]: 0n, [BOB]: 100n },
+      200: { [BOB]: 60n, [CHARLIE]: 40n },
+    });
+
+    const completed: { toBlock: number; knownGoodKeys: string[] }[] = [];
+    await runReconciliationCheckpoints({
+      client,
+      intervalBlocks: 100,
+      upToBlock: 200,
+      fromBlock: 1,
+      events,
+      onWindowComplete: (result, knownGoodBalances) => {
+        completed.push({ toBlock: result.toBlock, knownGoodKeys: [...knownGoodBalances.keys()].sort() });
+      },
+    });
+
+    expect(completed.map((c) => c.toBlock)).toEqual([100, 200]);
+    // After window 1, only Alice/Bob are known; after window 2, Charlie too.
+    expect(completed[0]!.knownGoodKeys.sort()).toEqual([ALICE, BOB].sort());
+    expect(completed[1]!.knownGoodKeys.sort()).toEqual([ALICE, BOB, CHARLIE].sort());
+  });
 });

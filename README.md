@@ -480,6 +480,27 @@ the next long run:
   (`SELECT MAX(block_number) FROM transfers`, which lands on a batch boundary) and rewrite the
   checkpoint to match, rather than redecoding from scratch.
 
+**A fourth thing, found for real 2026-09-11 by actually running `chain:reconcile-checkpoints` against
+live chain data for the first time (see that section below): `Balances.DustLost` was never decoded,
+and it should have been from the start.** Substrate reaps an account once a balance mutation drops
+its free balance below the existential deposit, emitting `DustLost { account, amount }` for the exact
+remaining balance it sweeps to zero — same two-field shape as `Withdraw { who, amount }`, but
+`decodeEvents.ts`/`normalize.ts` only ever handled `Transfer`/`Deposit`/`Withdraw`. An account that
+gets reaped kept a phantom leftover balance in the fold forever. Confirmed against a real block
+(mainnet 9809, spec_version 107, `fixtures/chain/block-9809-dustlost.json`): a coldkey with a real
+9,999,712-rao baseline, a 143-rao fee withdraw, a `DustLost` of the exact 1-rao remainder, then a
+9,999,568-rao transfer out — the fold without `DustLost` reconstructed balance 1; the real chain says
+0. **Fixed by normalizing `DustLost` to a `withdraw` `BalanceEvent`** (`normalizeBalanceEvent` in
+`packages/core/src/events/normalize.ts`, extraction in `decodeEvents.ts`) — no core-reducer change
+needed, since debiting the swept amount is exactly what reaping does. Verified against real data at
+small scale: reconciling blocks 1-20,000 against a freshly-materialized silver (built from a local
+mirror of that block range's real bronze) went from **5,080 mismatches to 0** across 6,383 touched
+coldkeys. **The real, full-range `data/silver/balance_events.parquet` still predates this fix** — it
+was built before `DustLost` was decoded, so `chain:materialize-silver` needs a full rerun (hours,
+local-only, no RPC) before the full-range reconciliation reflects it. Until then, expect the full
+reconciliation run's mismatch count to be dominated by this now-fixed-in-code-but-not-yet-
+re-materialized gap, not by anything still genuinely wrong with the fold.
+
 ### Phase 2.3 — reconciliation checkpoints
 
 ```
@@ -489,7 +510,40 @@ pnpm chain:reconcile-checkpoints    # incremental reconciliation, genesis -> UP_
 Required env: `UP_TO_BLOCK` — the block `chain:materialize-silver` has actually decoded up to
 (check `data/meta/chain_backfill_checkpoint.json`'s `lastCompletedBlock`, then confirm silver was
 re-materialized against that bronze), **not** the live chain head. Optional: `FROM_BLOCK` (default
-1), `CHECKPOINT_INTERVAL_BLOCKS` (default 216,000, ≈30 days at 12s/block).
+1), `CHECKPOINT_INTERVAL_BLOCKS` (default 216,000, ≈30 days at 12s/block), `CHAIN_MAX_RPM` (default
+40), `CHAIN_CONCURRENCY` (default 1 — see below, do not run a real pass at the default).
+
+**`CHAIN_CONCURRENCY` — added 2026-09-11, and matters here for the same reason it did for
+`chain:backfill`.** `reconcileBalances`'s two `state_getStorage`-per-coldkey passes (fresh
+baselines, then final balances) used to await one coldkey at a time — latency-bound at ~270ms/call
+RTT (§4.2/§6's finding, same root cause), not rate-limit-bound. At concurrency 1 the estimated
+1,674,167-call full run (see below) projects to **~5 days of wall-clock time**, even though the RU
+cost is only ~8% of Pro's monthly quota — budget was never the real constraint here, throughput was.
+Fixed the same way `fetchBlockRange.ts` fixed it for the backfill: both passes now run through a
+small order-preserving worker pool (`mapWithConcurrency`, `packages/pipeline/src/chain/concurrency.ts`,
+covered by `concurrency.test.ts` and a `reconcileBalances.test.ts` case asserting overlapping
+in-flight calls produce identical results to sequential). Set `CHAIN_CONCURRENCY` the same way the
+backfill did (`CHAIN_MAX_RPM=11500 CHAIN_CONCURRENCY=50`, or similar) — untested against a real
+sustained run yet, so measure a short real window before committing to the full range; the
+backfill's own ~110-120 calls/s ceiling is a reasonable planning number but reconciliation's call
+shape (single `state_getStorage` reads, not two-calls-per-block) hasn't been confirmed to hit the
+same ceiling.
+
+**Cross-run checkpointing — also added 2026-09-11, before any real run was attempted.** Before this,
+a restart re-verified every earlier window from scratch (no persistence across invocations at all) —
+tolerable for a fixture-backed test, not for a run spending real RU on every `state_getStorage` call
+it repeats. `data/meta/reconciliation_checkpoint.json` (`packages/pipeline/src/chain/
+reconciliationCheckpoint.ts`) now persists `lastCompletedWindowEnd` and the validated
+`knownGoodBalances` map after every window (`onWindowComplete`, wired in the script). A rerun with
+the same `FROM_BLOCK`/`CHECKPOINT_INTERVAL_BLOCKS` picks up at the next window instead of redoing
+completed ones — keyed on those two values only, **not** `UP_TO_BLOCK`, so (mirroring
+`chain:materialize-silver`'s own checkpoint) rerunning later with a larger `UP_TO_BLOCK` as the
+backfill/silver progresses just reconciles the newly-reachable windows on top of what's already
+validated. An unreadable (e.g. power-loss-corrupted) checkpoint is treated as "no checkpoint" and
+restarts from `FROM_BLOCK`, same recovery as the gold-shard and silver-materialization checkpoints.
+Covered by `reconciliationCheckpoint.test.ts` (round-trip, range mismatch, corruption recovery) and
+new `runReconciliationCheckpoints.test.ts` cases (`resumeFrom` skips completed windows;
+`onWindowComplete` fires once per window with the right balance state).
 
 This walks consecutive, non-overlapping windows from genesis to `UP_TO_BLOCK`, reconciling each
 against real `System.Account` reads the same way `chain:reconcile-balances` always has — but
@@ -536,6 +590,26 @@ but climbing well past that in the busier later windows). **Budget is not the bl
 comfortably fits in a single month's Pro quota alongside room to spare; the earlier "size before
 spending" caution was warranted (it wasn't obvious a priori that 41 × 505K would stay this small)
 but the answer is a green light, not a further blocker.
+
+**First real run against live chain data, 2026-09-11 — small samples only, not the full range yet,
+but this is what `chain:reconcile-checkpoints` has been waiting on since Phase 2.3 closed.** Two
+things fell out of actually running it for the first time:
+
+1. **The concurrency and checkpoint fixes above both held up.** Blocks 1-10,000 (5,659 touched
+   coldkeys) reconciled cleanly at `CHAIN_CONCURRENCY=50`; a second invocation with a larger
+   `UP_TO_BLOCK` correctly skipped that window (0 new RPC calls for it) and only processed the next
+   one, finishing in ~9s wall time.
+2. **It immediately found the real `DustLost` decoding gap documented above** — 5,080 mismatches
+   across those same two windows before the fix, 0 after, once reconciled against a freshly
+   `DustLost`-inclusive silver. This is exactly what reconciliation is for; the sample run did its
+   job on the first real attempt.
+
+**Not yet done: the full genesis-to-head run.** It needs `data/silver/balance_events.parquet`
+rebuilt first (the real one still predates the `DustLost` fix — see above), which is the long pole
+now, not RPC budget or throughput. Once that's rebuilt, rerun `chain:reconcile-checkpoints` with
+`UP_TO_BLOCK=8929643` and a real `CHAIN_CONCURRENCY` — untested at that scale, so treat the
+backfill's ~110-120 calls/s ceiling as a planning number, not a confirmed one, and watch the first
+hour or so of a real full run before assuming it'll hold.
 
 ### Sharded gold metrics (`shard_by`)
 

@@ -30,6 +30,23 @@ export interface RunReconciliationCheckpointsOptions {
    * — lets tests exercise the windowing/carry-forward logic without real
    * silver Parquet files on disk. */
   events?: readonly BalanceEvent[];
+  /** Forwarded to each `reconcileBalances` call — see its own doc comment.
+   * Default 1 (sequential, the original behavior). */
+  concurrency?: number;
+  /**
+   * Resume point for both the window walk and the balance state, as saved by
+   * an earlier invocation's `onWindowComplete` (see `reconciliationCheckpoint.ts`).
+   * Defaults to `fromBlock ?? 1` / an empty map — a fresh run from genesis (or
+   * `fromBlock`), unchanged from before this option existed.
+   */
+  resumeFrom?: { windowStart: number; knownGoodBalances: BalanceMap };
+  /**
+   * Called synchronously after each window completes, before starting the
+   * next one — the caller's hook for persisting a checkpoint. Awaited before
+   * continuing, so a checkpoint is durably written before any further RPC
+   * spend for the next window.
+   */
+  onWindowComplete?: (result: CheckpointResult, knownGoodBalances: BalanceMap) => void | Promise<void>;
 }
 
 /**
@@ -59,8 +76,8 @@ export async function runReconciliationCheckpoints(
   const events = opts.events ?? (await loadEventsFromSilver(opts.upToBlock));
   const results: CheckpointResult[] = [];
 
-  let knownGoodBalances: BalanceMap = new Map<Coldkey, Rao>();
-  let windowStart = opts.fromBlock ?? 1;
+  let knownGoodBalances: BalanceMap = opts.resumeFrom?.knownGoodBalances ?? new Map<Coldkey, Rao>();
+  let windowStart = opts.resumeFrom?.windowStart ?? opts.fromBlock ?? 1;
 
   while (windowStart + opts.intervalBlocks - 1 <= opts.upToBlock) {
     const windowEnd = windowStart + opts.intervalBlocks - 1;
@@ -71,15 +88,18 @@ export async function runReconciliationCheckpoints(
       client: opts.client,
       knownGoodBalances,
       events,
+      concurrency: opts.concurrency,
     });
 
     knownGoodBalances = result.balances;
-    results.push({
+    const checkpointResult: CheckpointResult = {
       fromBlock: windowStart,
       toBlock: windowEnd,
       touchedAccounts: result.touchedAccounts,
       mismatches: result.rows.filter((row) => !row.matches),
-    });
+    };
+    results.push(checkpointResult);
+    await opts.onWindowComplete?.(checkpointResult, knownGoodBalances);
 
     windowStart = windowEnd + 1;
   }

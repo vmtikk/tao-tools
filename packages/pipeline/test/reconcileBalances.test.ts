@@ -167,4 +167,40 @@ describe("reconcileBalances", () => {
     expect(result.rows.map((r) => r.coldkey).sort()).toEqual([BOB, CHARLIE].sort());
     expect(result.touchedAccounts).toBe(2);
   });
+
+  it("concurrency > 1 produces the same result as sequential, with reads actually overlapping", async () => {
+    // Alice, Bob, and Charlie are all newly touched in this window, so both
+    // the baseline pass and the final-balance pass have 3 coldkeys each to
+    // read — enough to observe overlap at concurrency 2.
+    const events: BalanceEvent[] = [
+      transfer(150, 0, ALICE, BOB, 10n),
+      transfer(160, 1, BOB, CHARLIE, 4n),
+    ];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const base = fakeClientForColdkeys({
+      99: { [ALICE]: 100n, [BOB]: 0n, [CHARLIE]: 0n },
+      200: { [ALICE]: 90n, [BOB]: 6n, [CHARLIE]: 4n },
+    });
+    const client: BlockmachineClient & { calls: [string, unknown[]][] } = {
+      ...base,
+      async call<T>(method: string, params: unknown[]): Promise<T> {
+        if (method !== "state_getStorage") return base.call(method, params);
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const result = await base.call<T>(method, params);
+        inFlight--;
+        return result;
+      },
+    };
+
+    const result = await reconcileBalances({ fromBlock: 100, toBlock: 200, client, events, concurrency: 2 });
+
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(result.rows.find((r) => r.coldkey === ALICE)!.reconstructedRao).toBe(90n);
+    expect(result.rows.find((r) => r.coldkey === BOB)!.reconstructedRao).toBe(6n);
+    expect(result.rows.find((r) => r.coldkey === CHARLIE)!.reconstructedRao).toBe(4n);
+    expect(result.rows.every((r) => r.matches)).toBe(true);
+  });
 });

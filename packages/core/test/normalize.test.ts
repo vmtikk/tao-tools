@@ -51,6 +51,21 @@ describe("normalizeBalanceEvent", () => {
     });
   });
 
+  it("normalizes a DustLost as a withdraw (the runtime reaping an account below the existential deposit)", () => {
+    const result = normalizeBalanceEvent(
+      { section: "balances", method: "DustLost", data: ["5Alice", 1n] },
+      BLOCK,
+      3,
+    );
+    expect(result).toEqual({
+      kind: "withdraw",
+      blockNumber: BLOCK,
+      eventIndex: 3,
+      coldkey: asColdkey("5Alice"),
+      amount: asRao(1n),
+    });
+  });
+
   it("returns null for a non-balances section", () => {
     expect(normalizeBalanceEvent({ section: "system", method: "ExtrinsicSuccess", data: [] }, BLOCK, 0)).toBeNull();
   });

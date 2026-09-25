@@ -654,6 +654,34 @@ checkpoints" clause is still outstanding.)
    the monthly quota the backfill itself blew through) didn't materialize: reconciliation is far
    cheaper than the backfill because most of the 505,493 coldkeys are touched once, not every
    window. Budget is no longer the open question — the run itself just needs to happen.
+5. **Found and fixed 2026-09-11, before the run happened: budget was solved but wall-clock time
+   wasn't.** `reconcileBalances` awaited one `state_getStorage` call per coldkey at a time — the
+   same latency-bound shape §6's Phase 2 samples already diagnosed for `chain:backfill` (~270ms/call
+   RTT, not the rate limit, dominates at concurrency 1). Projected over 1,674,167 calls: **~5 days**,
+   despite the RU cost being trivial. Fixed the same way `fetchBlockRange.ts` was: both of
+   `reconcileBalances`'s per-coldkey passes now run through a small worker pool
+   (`mapWithConcurrency`, `packages/pipeline/src/chain/concurrency.ts`), controlled by the same
+   `CHAIN_CONCURRENCY` env var the backfill uses. See the README's "Phase 2.3 — reconciliation
+   checkpoints" section for the full note, including that reconciliation's call shape (single reads,
+   not two-per-block) hasn't yet been confirmed to hit the backfill's measured ~110-120 calls/s
+   ceiling — worth a short real sample before committing to the full range.
+6. **First real run against live chain data, 2026-09-11 (small samples, blocks 1-20,000) — both the
+   fix above held up, and it immediately found a second, previously-unknown real gap.** Concurrency
+   50 and cross-run checkpointing both worked cleanly against the live API. But the sample surfaced
+   `Balances.DustLost` — the runtime reaping an account once a mutation drops its free balance below
+   the existential deposit — as never having been decoded at all (`normalizeBalanceEvent` only
+   handled `Transfer`/`Deposit`/`Withdraw`), leaving reaped accounts with a phantom leftover balance
+   in the fold forever. 5,080 of 6,383 touched coldkeys mismatched before the fix; 0 after, once
+   reconciled against a freshly `DustLost`-inclusive silver (verified via a local mirror of that
+   block range's real bronze, not the full 8.9M-block one). Fixed by normalizing `DustLost` to a
+   `withdraw` `BalanceEvent` (`packages/core/src/events/normalize.ts` — same two-field shape as
+   `Withdraw`, so no core-reducer change was needed), backed by a real fixture
+   (`fixtures/chain/block-9809-dustlost.json`, mainnet block 9809). **The real, full-range
+   `data/silver/balance_events.parquet` still predates this fix and needs a full
+   `chain:materialize-silver` rerun (hours, local-only, no RPC) before the full genesis-to-head
+   reconciliation reflects it** — that rerun, not RPC budget or throughput, is now the long pole
+   before Phase 3's numbers can be confirmed. See the README's "Decoding bronze -> silver at full
+   scale" and "Phase 2.3 — reconciliation checkpoints" sections for the full account.
 4. Phase 3's `account_balances_daily` (3.1) and the two wallet-count series have now been built and
    run against the **complete** index, but still ahead of step 3 passing — **their numbers remain
    provisional** until reconciliation actually confirms the fold. There is now hard evidence that

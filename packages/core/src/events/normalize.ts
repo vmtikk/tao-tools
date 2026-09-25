@@ -21,9 +21,21 @@ export interface DecodedEvent {
 /**
  * Normalizes a decoded `pallet_balances` event into a {@link BalanceEvent}.
  * Returns null for every event this pipeline doesn't fold into balances yet
- * (any non-`balances` section, and `balances` methods other than the three
+ * (any non-`balances` section, and `balances` methods other than the four
  * listed below — e.g. `Reserved`/`Unreserved`/`Slashed` are not part of the
  * Phase 2.1/2.2 tracer bullet).
+ *
+ * `DustLost` normalizes to a `withdraw`, not a distinct `BalanceEvent` kind.
+ * Found for real (2026-09-11, reconciling blocks 1-10,000 against live chain
+ * data): the runtime reaps an account once a mutation drops its free balance
+ * below the existential deposit, emitting `DustLost { account, amount }` for
+ * the exact remaining balance it sweeps — same `(who, amount)` shape as
+ * `Withdraw`, and debiting that amount is exactly what reaping does to the
+ * fold's own balance map. Without this, an account that gets reaped keeps a
+ * phantom leftover balance in the fold forever (confirmed against a real
+ * account: baseline 9,999,712 rao, a 143-rao fee withdraw, a 9,999,568-rao
+ * transfer out, and a `DustLost` of the exact 1-rao remainder — the fold
+ * without `DustLost` reconstructs balance 1; the real on-chain balance is 0).
  */
 export function normalizeBalanceEvent(
   evt: DecodedEvent,
@@ -48,7 +60,8 @@ export function normalizeBalanceEvent(
       const [coldkey, amount] = evt.data as [string, bigint];
       return { kind: "deposit", blockNumber, eventIndex, coldkey: asColdkey(coldkey), amount: asRao(amount) };
     }
-    case "Withdraw": {
+    case "Withdraw":
+    case "DustLost": {
       const [coldkey, amount] = evt.data as [string, bigint];
       return { kind: "withdraw", blockNumber, eventIndex, coldkey: asColdkey(coldkey), amount: asRao(amount) };
     }

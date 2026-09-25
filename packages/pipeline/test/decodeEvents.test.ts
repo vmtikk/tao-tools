@@ -61,6 +61,46 @@ describe("decodeEvents (contract — recorded real Blockmachine responses)", () 
 });
 
 /**
+ * Real `DustLost` event (mainnet block 9809, spec_version 107, captured
+ * 2026-09-11 from bronze already in R2 — see fixtures/chain/block-9809-
+ * dustlost.json). Found while investigating a real `chain:reconcile-
+ * checkpoints` mismatch: a coldkey the fold reconstructed at balance 1 rao,
+ * versus a real on-chain balance of 0 — this block is why. Three balances
+ * events touch the same coldkey in order: `Withdraw(143)` (a fee), then
+ * `DustLost(1)` (the runtime reaping the account once its balance dropped
+ * below the existential deposit), then `Transfer(9,999,568)` out. Before
+ * `DustLost` was decoded, the fold only saw the withdraw and the transfer;
+ * decoding `DustLost` too is what makes the reconstructed balance land on
+ * exactly 0, matching the real chain.
+ */
+describe("decodeChainEventsForBlock — DustLost (contract — recorded real Blockmachine/bronze response)", () => {
+  const metadataFixture = JSON.parse(
+    readFileSync(join(import.meta.dirname, "..", "..", "..", "fixtures", "chain", "metadata-specVersion107.json"), "utf-8"),
+  ) as { metadataHex: string };
+  const blockFixture = JSON.parse(
+    readFileSync(join(import.meta.dirname, "..", "..", "..", "fixtures", "chain", "block-9809-dustlost.json"), "utf-8"),
+  ) as { block9809: { blockNumber: number; eventsHex: string } };
+
+  it("decodes DustLost as a withdraw-shaped balance event, in the right position among the block's other balance events", () => {
+    const registry = buildRegistry(metadataFixture.metadataHex);
+    const events = decodeBalanceEventsForBlock(
+      registry,
+      blockFixture.block9809.eventsHex,
+      blockFixture.block9809.blockNumber,
+    );
+
+    const coldkey = "5DaVTUeVE2uHcVJrw25zprundjWmh1csd1j61BjUaogEYarr";
+    const touching = events.filter((e) => (e.kind === "withdraw" ? e.coldkey === coldkey : e.kind === "transfer" && e.from === coldkey));
+
+    expect(touching.map((e) => ({ kind: e.kind, amount: e.amount }))).toEqual([
+      { kind: "withdraw", amount: asRao(143n) }, // the fee
+      { kind: "withdraw", amount: asRao(1n) }, // DustLost, normalized to a withdraw
+      { kind: "transfer", amount: asRao(9_999_568n) },
+    ]);
+  });
+});
+
+/**
  * Real pre-dTAO StakeAdded/StakeRemoved events (mainnet blocks 90 and 795,
  * spec_version 101, captured 2026-08-27 from bronze already in R2 — see
  * fixtures/chain/blocks-stake-events.json). No live RPC needed to record
