@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import type { MetricEntry } from "@tao-tools/core";
+import { palletIdOf, type MetricEntry } from "@tao-tools/core";
 import { withDuckDb } from "../duckdb/session.js";
 import { goldDir, metaDir, silverDir } from "../paths.js";
 import { loadRegistry } from "../registry/loader.js";
@@ -225,6 +225,35 @@ export async function materializeGold(registryPath?: string): Promise<Materializ
       };
 
       await createChainSilverViews(null);
+
+      // Runtime-controlled ("modl"-prefixed) accounts, so registry SQL can
+      // tell protocol plumbing apart from user activity. DuckDB can't decode
+      // SS58, so classification happens here in TS over the distinct transfer
+      // legs. Built from the full, unsharded views, and only when some entry
+      // actually references it — the distinct scan over every transfer leg
+      // isn't free at full chain scale.
+      await connection.run("CREATE OR REPLACE TABLE pallet_accounts (coldkey VARCHAR, pallet_id VARCHAR);");
+      const needsPalletAccounts = entries.some((entry) => /\bpallet_accounts\b/.test(entry.sql));
+      if (needsPalletAccounts && existsSync(`${silverDir()}/transfers.parquet`)) {
+        const legs = await connection
+          .run(
+            "SELECT from_coldkey FROM silver_transfers UNION SELECT to_coldkey FROM silver_transfers;",
+          )
+          .then((r) => r.getRows());
+        const palletRows: string[] = [];
+        for (const [coldkey] of legs) {
+          const palletId = palletIdOf(String(coldkey));
+          if (palletId !== null) {
+            // Pallet ids are ASCII by convention, but a NUL byte would break the literal.
+            const printableId = palletId.replace(/[^\x20-\x7e]/g, "?");
+            palletRows.push(`('${escapeSqlLiteral(String(coldkey))}', '${escapeSqlLiteral(printableId)}')`);
+          }
+        }
+        if (palletRows.length > 0) {
+          await connection.run(`INSERT INTO pallet_accounts VALUES ${palletRows.join(", ")};`);
+        }
+        console.log(`pallet_accounts: ${palletRows.length} pallet-derived accounts among ${legs.length} distinct transfer legs.`);
+      }
 
       // Optional, same as silver_balance_events above — an environment that
       // hasn't run `trends:backfill` yet is valid, not an error, so any

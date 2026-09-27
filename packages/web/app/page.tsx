@@ -10,6 +10,7 @@ export default function HomePage() {
   const btcSeries = gold.series.find((s) => s.metric === "price_composite_btc_daily");
   const volumeSeries = gold.series.find((s) => s.metric === "volume_usd_daily");
   const transferCountSeries = gold.series.find((s) => s.metric === "transfer_count_daily");
+  const protocolTransferCountSeries = gold.series.find((s) => s.metric === "transfer_count_protocol_daily");
 
   return (
     <main>
@@ -68,7 +69,7 @@ export default function HomePage() {
       </section>
 
       <section className="chart-section">
-        <h2>Daily transfer count</h2>
+        <h2>Daily user transfers</h2>
         <p className="section-subtitle">
           Daily, decoded from raw chain events, over whatever block range is currently backfilled.
           {transferCountSeries ? ` Metric v${transferCountSeries.version}.` : ""}
@@ -76,8 +77,26 @@ export default function HomePage() {
         <div className="chart-card">
           <TransferCountChart points={transferCountSeries?.points ?? []} />
           <p className="caveat">
-            Covers whatever prefix of chain history <code>chain:backfill</code> has reached so far,
-            not necessarily the full history to date (tao-analytics-plan.md §6).
+            <strong>Excludes runtime-driven transfers</strong> — any transfer with a pallet-derived
+            account (e.g. subtensor&apos;s own subnet accounts) on either side is counted in the protocol
+            chart below instead. Covers whatever prefix of chain history <code>chain:backfill</code> has
+            reached so far (tao-analytics-plan.md §6).
+          </p>
+        </div>
+      </section>
+
+      <section className="chart-section">
+        <h2>Daily protocol transfers</h2>
+        <p className="section-subtitle">
+          Transfers with a pallet-derived account on either side.
+          {protocolTransferCountSeries ? ` Metric v${protocolTransferCountSeries.version}.` : ""}
+        </p>
+        <div className="chart-card">
+          <TransferCountChart points={protocolTransferCountSeries?.points ?? []} />
+          <p className="caveat">
+            Internal protocol movements, not user activity. Near zero until subtensor runtime 411
+            (block 8,283,784, May 2026), which began sweeping each subnet&apos;s account into the main
+            subtensor account roughly 200 times a block.
           </p>
         </div>
       </section>

@@ -37,13 +37,18 @@
     },
     {
       "metric": "transfer_count_daily",
-      "version": 2,
+      "version": 3,
       "points": [
         {
           "timestampMs": 1769990400000,
           "value": 3
         }
       ]
+    },
+    {
+      "metric": "transfer_count_protocol_daily",
+      "version": 1,
+      "points": []
     },
     {
       "metric": "wallet_count_free_balance",

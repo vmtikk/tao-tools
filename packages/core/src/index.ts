@@ -11,3 +11,4 @@ export * from "./crossRate.js";
 export * from "./retry.js";
 export * from "./events/normalize.js";
 export * from "./balances/reconstruct.js";
+export * from "./chain/palletAccount.js";

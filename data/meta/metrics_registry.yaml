@@ -203,11 +203,14 @@
     - v2: "restricted to Binance only (was: summed across every USD/USDT venue present). Found 2026-09-10: with real backfill history in place, venues started at very different dates, so the multi-venue sum jumped every time a new venue's history began — not a real activity change, just more venues contributing. Binance has continuous history back to 2024-04-11 (the earliest any venue has TAO data at all), so restricting to it makes every point in the series comparable to every other, at the cost of undercounting once Coinbase/OKX/MEXC are also trading."
 
 - name: transfer_count_daily
-  version: 2
+  version: 3
   definition: >
-    Count of Balances.Transfer events per UTC day, over whatever block range is
-    currently in silver.transfers. Requires chain bronze; absent in a Phase 1-only
-    environment (see materializeGold's guard on silver_transfers).
+    Count of user Balances.Transfer events per UTC day — transfers where neither
+    leg is a pallet-derived ("modl") account, over whatever block range is
+    currently in silver.transfers. Transfers touching a pallet account on either
+    leg are runtime-driven and counted separately in transfer_count_protocol_daily.
+    Requires chain bronze; absent in a Phase 1-only environment (see
+    materializeGold's guard on silver_transfers).
   params: {}
   depends_on: []
   sql: >
@@ -215,11 +218,34 @@
       (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
       COUNT(*) AS value
     FROM silver_transfers
+    WHERE from_coldkey NOT IN (SELECT coldkey FROM pallet_accounts)
+      AND to_coldkey NOT IN (SELECT coldkey FROM pallet_accounts)
     GROUP BY 1
     ORDER BY 1
   changelog:
     - v1: "initial (Phase 2.1) as transfer_count_per_block, one point per exact block timestamp — fine for the ~1,000-block Phase 2.1 tracer bullet, but found for real (2026-09-05) to produce 1.3M points against the real ~5.8M-block backfill prefix, which a browser cannot render (1.3M SVG bars) or even receive quickly (~200MB page, ~40s load)"
     - v2: "renamed to transfer_count_daily and rebucketed to UTC days, matching every other time-series metric in this registry (volume_usd_daily, account_balances_daily, wallet_count_*, exchange_balances_daily) — per-block resolution was never meaningful past a few thousand blocks anyway, since a chart can only show as many distinct columns as it has pixels"
+    - v3: "excludes transfers with a pallet-derived account on either leg (2026-09-27). Subtensor runtime 411 (block 8,283,784) started sweeping per-subnet 'subtensr' sub-accounts into the main one ~200 times a block, plus ~1.8M/month of pallet<->user payouts — June 2026 showed 42.8M transfers, ~99% of them touching a pallet account, against ~350K/month of ordinary transfers. v2 read that as an 80x activity surge. Before 411 this removes only a few dozen transfers a month, so v3 stays comparable across the upgrade. The pallet-touching transfers moved to transfer_count_protocol_daily rather than being dropped"
+
+- name: transfer_count_protocol_daily
+  version: 1
+  definition: >
+    Count of Balances.Transfer events per UTC day where either leg is a
+    pallet-derived ("modl") account — runtime-driven movements (e.g. subtensor's
+    per-subnet sweeps since runtime 411), the complement of transfer_count_daily.
+  params: {}
+  depends_on: []
+  sql: >
+    SELECT
+      (timestamp_ms // 86400000) * 86400000 AS timestamp_ms,
+      COUNT(*) AS value
+    FROM silver_transfers
+    WHERE from_coldkey IN (SELECT coldkey FROM pallet_accounts)
+       OR to_coldkey IN (SELECT coldkey FROM pallet_accounts)
+    GROUP BY 1
+    ORDER BY 1
+  changelog:
+    - v1: "initial (2026-09-27), split out of transfer_count_daily v3"
 
 - name: account_balances_daily
   version: 2

@@ -501,6 +501,22 @@ local-only, no RPC) before the full-range reconciliation reflects it. Until then
 reconciliation run's mismatch count to be dominated by this now-fixed-in-code-but-not-yet-
 re-materialized gap, not by anything still genuinely wrong with the fold.
 
+**Why the tail of the chain is so slow to decode, and why transfer counts exploded (2026-09-27).**
+The rebuild above ran at ~30s per 3,000-block batch until block 8,283,000, then stepped to
+~180-250s and stayed there. Not a regression (the flush-interval fix above is intact): subtensor
+runtime 411 went live at block 8,283,784, and average `System.Events` size per block jumped ~4x
+(~6 KB to ~25 KB). Starting the very next block, the runtime sweeps each subnet's `subtensr`
+pallet sub-account into the main `subtensr` account, ~200 `Balances.Transfer`s per block. June
+2026 alone has 42.8M transfers, ~99% of them touching a pallet account, against ~350K/month of
+ordinary transfers, so ~40% of all transfers in chain history sit in the last two months or so.
+`transfer_count_daily` v2 showed that as an 80x activity surge. **Split in registry v3:**
+`transfer_count_daily` now counts only transfers with no pallet-derived account on either leg, and
+the rest moved to `transfer_count_protocol_daily`. Pallet accounts are identified by decoding each
+distinct transfer leg's SS58 address (`palletIdOf`, `packages/core/src/chain/palletAccount.ts`: a
+32-byte account id starting with `modl`), exposed to registry SQL as a `pallet_accounts` table
+that `materializeGold` builds only when an entry references it. Wallet counts are unaffected, since
+pallet accounts are a handful of the 505K coldkeys.
+
 ### Phase 2.3 — reconciliation checkpoints
 
 ```
