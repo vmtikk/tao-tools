@@ -11,8 +11,11 @@ set -euo pipefail
 # you want fresh charts — it just reads the same R2 bucket this keeps
 # topped up. It is NOT part of this script and doesn't need to run here.
 #
-# CAVEAT: shares data/meta/chain_backfill_checkpoint.json with a manual
-# one-off `chain:backfill` run. Never run both at once.
+# CAVEAT: shares the chain backfill checkpoint (in R2, or locally in dev —
+# see chain/r2Checkpoint.ts) with any other `chain:backfill`/`sync-bronze.sh`
+# run against the same bucket, on this machine or another. Never run two at
+# once — last write wins, no locking across machines, only within one
+# (the flock below).
 # 
 # Recommended runner: systemd timer, see deploy/tao-sync.{service,timer} —
 # follow logs live with `journalctl -u tao-sync -f`.
@@ -36,16 +39,16 @@ set +a
 
 log "=== bronze sync start ==="
 
-CHECKPOINT_FILE="${DATA_ROOT:-$(pwd)/data}/meta/chain_backfill_checkpoint.json"
-if [ ! -f "$CHECKPOINT_FILE" ]; then
-  log "ERROR: no checkpoint at $CHECKPOINT_FILE — copy it over from wherever the initial 'pnpm chain:backfill' ran (see deploy/push-to-server.sh), or run that once here first."
+# The checkpoint lives in R2 (chain/meta/backfill_checkpoint.json) whenever
+# BRONZE_URI is s3://, which is what makes this script safe to run on any
+# machine with the right .env — no checkpoint file to copy over first. Only
+# a local-path BRONZE_URI (dev only) falls back to a local checkpoint file,
+# and even that just starts from block 1 if it's missing rather than erroring.
+NEXT_FROM_BLOCK=$(pnpm --silent --filter @tao-tools/ingest run chain:next-from-block)
+if ! [[ "$NEXT_FROM_BLOCK" =~ ^[0-9]+$ ]]; then
+  log "ERROR: chain:next-from-block didn't print a number (got: $NEXT_FROM_BLOCK)"
   exit 1
 fi
-
-NEXT_FROM_BLOCK=$(node -e "
-  const c = JSON.parse(require('fs').readFileSync('$CHECKPOINT_FILE', 'utf-8'));
-  console.log(c.lastCompletedBlock + 1);
-")
 
 log "chain:backfill from block $NEXT_FROM_BLOCK to current chain head"
 FROM_BLOCK="$NEXT_FROM_BLOCK" \

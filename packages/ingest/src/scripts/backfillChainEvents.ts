@@ -5,7 +5,8 @@ import { fetchRuntimeMetadata } from "../chain/fetchMetadata.js";
 import { fetchChainHead } from "../chain/fetchChainHead.js";
 import { detectRuntimeSegments, type RuntimeSegment } from "../chain/detectRuntimeUpgrades.js";
 import { appendRuntimeVersions } from "../chain/runtimeVersionsLog.js";
-import { readCheckpoint, readCheckpointToBlock, writeCheckpoint } from "../chain/backfillCheckpoint.js";
+import { readCheckpoint, readCheckpointToBlock, writeCheckpoint, type BackfillCheckpoint } from "../chain/backfillCheckpoint.js";
+import { isRemoteBronze, readCheckpointFromR2, writeCheckpointToR2 } from "../chain/r2Checkpoint.js";
 import { writeChainEventsBronze, writeChainMetadataBronze } from "../chain/bronzeWriter.js";
 
 /**
@@ -62,22 +63,35 @@ async function main(): Promise<void> {
     },
   });
 
+  // R2 is the shared source of truth once bronze itself is remote (see
+  // chain/r2Checkpoint.ts) — fetched once here and reused below for both
+  // TO_BLOCK resolution and the resume check, rather than round-tripping to
+  // R2 twice. Local dev (BRONZE_URI left as a local path) keeps reading the
+  // plain-fs checkpoint, unchanged.
+  const remote = isRemoteBronze();
+  const remoteCheckpoint = remote ? await readCheckpointFromR2() : null;
+  const matchesRemote = (from: number): boolean => remoteCheckpoint !== null && remoteCheckpoint.fromBlock === from;
+
   // Resolve TO_BLOCK once and stick with it across restarts: if left unset,
   // re-resolving "current chain head" on every run would produce a
   // different value each time (the head moves every ~12s), which would
   // never match the checkpoint's pinned toBlock and would silently restart
   // the whole range instead of resuming (see backfillCheckpoint.ts's doc
   // comment on readCheckpointToBlock).
-  const toBlock = process.env.TO_BLOCK
-    ? Number(process.env.TO_BLOCK)
-    : (readCheckpointToBlock(fromBlock) ?? (await fetchChainHead(client)));
+  const pinnedToBlock = remote
+    ? (matchesRemote(fromBlock) ? remoteCheckpoint!.toBlock : null)
+    : readCheckpointToBlock(fromBlock);
+  const toBlock = process.env.TO_BLOCK ? Number(process.env.TO_BLOCK) : (pinnedToBlock ?? (await fetchChainHead(client)));
 
   console.log(
     `Chain backfill: blocks ${fromBlock}-${toBlock} (${toBlock - fromBlock + 1} blocks), ` +
-      `chunked at ${chunkBlocks}, paced to ${maxRequestsPerMinute} req/min, concurrency ${concurrency}.`,
+      `chunked at ${chunkBlocks}, paced to ${maxRequestsPerMinute} req/min, concurrency ${concurrency}. ` +
+      `Checkpoint: ${remote ? "R2" : "local"}.`,
   );
 
-  const existingCheckpoint = readCheckpoint(fromBlock, toBlock);
+  const existingCheckpoint = remote
+    ? (matchesRemote(fromBlock) && remoteCheckpoint!.toBlock === toBlock ? remoteCheckpoint : null)
+    : readCheckpoint(fromBlock, toBlock);
   let resumeFrom = fromBlock;
   if (existingCheckpoint && existingCheckpoint.lastCompletedBlock >= fromBlock) {
     resumeFrom = existingCheckpoint.lastCompletedBlock + 1;
@@ -127,7 +141,12 @@ async function main(): Promise<void> {
     }
 
     await appendRuntimeVersions(segments);
-    writeCheckpoint({ fromBlock, toBlock, lastCompletedBlock: chunkEnd, updatedAtMs: Date.now() });
+    const checkpoint: BackfillCheckpoint = { fromBlock, toBlock, lastCompletedBlock: chunkEnd, updatedAtMs: Date.now() };
+    if (remote) {
+      await writeCheckpointToR2(checkpoint);
+    } else {
+      writeCheckpoint(checkpoint);
+    }
   }
 
   const totalElapsedS = (Date.now() - startedAt) / 1000;

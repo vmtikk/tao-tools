@@ -508,8 +508,10 @@ pnpm chain:reconcile-checkpoints    # incremental reconciliation, genesis -> UP_
 ```
 
 Required env: `UP_TO_BLOCK` — the block `chain:materialize-silver` has actually decoded up to
-(check `data/meta/chain_backfill_checkpoint.json`'s `lastCompletedBlock`, then confirm silver was
-re-materialized against that bronze), **not** the live chain head. Optional: `FROM_BLOCK` (default
+(check the chain backfill checkpoint's `lastCompletedBlock` — `data/meta/chain_backfill_checkpoint.json`
+locally, or `chain/meta/backfill_checkpoint.json` in R2 if `BRONZE_URI` is `s3://` (see
+`packages/ingest/src/chain/r2Checkpoint.ts`) — then confirm silver was re-materialized against that
+bronze), **not** the live chain head. Optional: `FROM_BLOCK` (default
 1), `CHECKPOINT_INTERVAL_BLOCKS` (default 216,000, ≈30 days at 12s/block), `CHAIN_MAX_RPM` (default
 40), `CHAIN_CONCURRENCY` (default 1 — see below, do not run a real pass at the default).
 
@@ -799,10 +801,17 @@ Because of that narrow scope, the server only needs `packages/core` +
 only the reverse) and not `packages/web`. Code reaches the server via a git
 sparse checkout (against a private GitHub remote — this repo doesn't have
 one yet, push it once: `git remote add origin <url> && git push -u origin
-master`); the small amount of local-only state that isn't in git (secrets,
-the chain backfill checkpoint) goes over via `deploy/push-state.sh`. YouTube
-and Trends need no equivalent checkpoint file — both scripts are stateless,
-so pushing `.env` (for `YOUTUBE_API_KEY`) is the only prerequisite they add.
+master`); the only local-only state that isn't in git (secrets) goes over
+via `deploy/push-state.sh`.
+
+The chain backfill checkpoint is **not** part of that state transfer — once
+`BRONZE_URI` points at R2, the checkpoint lives there too
+(`chain/meta/backfill_checkpoint.json`, next to bronze itself; see
+`packages/ingest/src/chain/r2Checkpoint.ts`), so any machine with a working
+`.env` resumes from the same point on its own. Moving which machine runs the
+sync — laptop to VPS, or back — is a `git pull`, not a file copy. (Local dev
+against a local-path `BRONZE_URI` still uses a local checkpoint file, same
+as before; there's nothing to share in that mode.)
 
 One-time setup, on the server:
 
@@ -820,11 +829,12 @@ Then, from this machine:
 deploy/push-state.sh user@your-server:/opt/tao-tools
 ```
 
-That pushes `.env` and `data/meta/chain_backfill_checkpoint.json`
-(gitignored, so they only exist here) — without the checkpoint the server
-would start `chain:backfill` over from block 1 instead of resuming. **Never
-run `sync-bronze.sh` on the server at the same time as a manual
-`chain:backfill` here** — both read/write that same checkpoint file.
+That pushes `.env` (gitignored, so it only exists here) — R2 credentials
+and Blockmachine's API key are all the server needs; `chain:backfill` reads
+its resume point straight from R2. **Never run `sync-bronze.sh` on two
+machines at once against the same bucket** — the checkpoint has no
+cross-machine locking, just last-write-wins (see `r2Checkpoint.ts`'s doc
+comment for why that's an acceptable tradeoff here).
 
 Back on the server, build and start all three timers:
 

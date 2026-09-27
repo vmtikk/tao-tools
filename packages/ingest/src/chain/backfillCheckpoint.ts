@@ -54,6 +54,19 @@ export function readCheckpointToBlock(fromBlock: number): number | null {
   return parsed.toBlock;
 }
 
+/**
+ * Whatever checkpoint is on disk, unfiltered by range — used by
+ * `r2Checkpoint.ts`'s `readEffectiveCheckpoint` (the local-dev side of "how
+ * far did the last run get, regardless of backend") and by
+ * `sync-bronze.sh` via `chain:next-from-block` to compute where the next
+ * incremental run should resume from.
+ */
+export function readRawCheckpoint(): BackfillCheckpoint | null {
+  const path = checkpointPath();
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf-8")) as BackfillCheckpoint;
+}
+
 export function writeCheckpoint(checkpoint: BackfillCheckpoint): void {
   mkdirSync(metaDir(), { recursive: true });
   const path = checkpointPath();

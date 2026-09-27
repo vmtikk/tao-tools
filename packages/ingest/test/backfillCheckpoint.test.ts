@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { clearCheckpoint, readCheckpoint, readCheckpointToBlock, writeCheckpoint } from "../src/chain/backfillCheckpoint.js";
+import { clearCheckpoint, readCheckpoint, readCheckpointToBlock, readRawCheckpoint, writeCheckpoint } from "../src/chain/backfillCheckpoint.js";
 
 describe("backfillCheckpoint", () => {
   let tempRoot: string;
@@ -70,6 +70,22 @@ describe("backfillCheckpoint", () => {
     it("returns null for a different fromBlock", () => {
       writeCheckpoint({ fromBlock: 1, toBlock: 8_900_000, lastCompletedBlock: 500_000, updatedAtMs: 1 });
       expect(readCheckpointToBlock(2)).toBeNull();
+    });
+  });
+
+  describe("readRawCheckpoint", () => {
+    it("returns null when no checkpoint exists", () => {
+      expect(readRawCheckpoint()).toBeNull();
+    });
+
+    it("returns whatever is on disk, unfiltered by range", () => {
+      writeCheckpoint({ fromBlock: 1, toBlock: 8_900_000, lastCompletedBlock: 500_000, updatedAtMs: 1 });
+      expect(readRawCheckpoint()).toEqual({
+        fromBlock: 1,
+        toBlock: 8_900_000,
+        lastCompletedBlock: 500_000,
+        updatedAtMs: 1,
+      });
     });
   });
 });
