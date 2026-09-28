@@ -12,6 +12,7 @@ export * from "./chain/detectRuntimeUpgrades.js";
 export * from "./chain/runtimeVersionsLog.js";
 export * from "./chain/backfillCheckpoint.js";
 export * from "./chain/fetchChainHead.js";
+export * from "./chain/accountSnapshot.js";
 export * from "./bronze/parquetWriter.js";
 export * from "./bronze/r2Secret.js";
 export * from "./env.js";

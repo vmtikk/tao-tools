@@ -18,6 +18,7 @@
     "spike-g": "tsx src/scripts/spikeG.ts",
     "chain:ingest": "tsx src/scripts/ingestChainRange.ts",
     "chain:backfill": "tsx src/scripts/backfillChainEvents.ts",
+    "chain:snapshot-accounts": "tsx src/scripts/snapshotAccounts.ts",
     "chain:next-from-block": "tsx src/scripts/printNextFromBlock.ts",
     "chain:migrate-checkpoint-to-r2": "tsx src/scripts/migrateCheckpointToR2.ts",
     "youtube:resolve-channels": "tsx src/scripts/resolveYoutubeChannels.ts",

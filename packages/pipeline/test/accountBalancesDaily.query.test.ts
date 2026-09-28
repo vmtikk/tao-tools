@@ -5,6 +5,12 @@ import { loadRegistry } from "../src/registry/loader.js";
 
 const REGISTRY_PATH = join(import.meta.dirname, "..", "..", "..", "data", "meta", "metrics_registry.yaml");
 
+const SNAPSHOTS_TABLE = `
+  CREATE TABLE silver_account_snapshots (
+    block_number BIGINT, timestamp_ms BIGINT, coldkey VARCHAR, free_rao BIGINT, reserved_rao BIGINT
+  );
+`;
+
 /**
  * Tier 2 (tao-analytics-plan.md §5): the registry SQL run verbatim against a
  * small hand-authored fixture, same pattern as transferCountPerBlock.query.test.ts.
@@ -28,6 +34,7 @@ describe("account_balances_daily registry SQL", () => {
           kind VARCHAR, coldkey VARCHAR, amount_rao BIGINT
         );
       `);
+      await connection.run(SNAPSHOTS_TABLE);
       // Day 0: Alice genesis-funded (deposit, no transfer — the
       // genesis-funded-accounts gap reconcileBalances.ts documents).
       await connection.run(`
@@ -83,6 +90,7 @@ describe("account_balances_daily registry SQL", () => {
           kind VARCHAR, coldkey VARCHAR, amount_rao BIGINT
         );
       `);
+      await connection.run(SNAPSHOTS_TABLE);
       await connection.run(`
         INSERT INTO silver_balance_events VALUES (1, 0, 0, 'deposit', '5Alice', 1000000000);
       `);
@@ -99,6 +107,43 @@ describe("account_balances_daily registry SQL", () => {
       ["5Alice", 0, 1000000000],
       // Unchanged by the self-transfer — not 910000000 or 1090000000.
       ["5Alice", 86400000, 1000000000],
+    ]);
+  });
+
+  /**
+   * Finney launched with 18,619 accounts funded directly in genesis state, so
+   * no event ever credits them. v2 started those at zero and they went
+   * negative as soon as they spent (10,581 coldkeys on real data).
+   */
+  it("seeds genesis balances from the block-0 snapshot, and ignores later snapshots", async () => {
+    const entry = loadRegistry(REGISTRY_PATH).find((e) => e.name === "account_balances_daily")!;
+
+    const rows = await withDuckDb(async (connection) => {
+      await connection.run(`
+        CREATE TABLE silver_transfers (
+          block_number BIGINT, event_index INTEGER, timestamp_ms BIGINT,
+          from_coldkey VARCHAR, to_coldkey VARCHAR, amount_rao BIGINT
+        );
+        CREATE TABLE silver_balance_events (
+          block_number BIGINT, event_index INTEGER, timestamp_ms BIGINT,
+          kind VARCHAR, coldkey VARCHAR, amount_rao BIGINT
+        );
+      `);
+      await connection.run(SNAPSHOTS_TABLE);
+      await connection.run(`
+        INSERT INTO silver_account_snapshots VALUES
+          (0, 1000, '5Genesis', 700, 300),   -- endowed at genesis: free + reserved = 1000
+          (0, 1000, '5Empty', 0, 0),         -- zero balance: no row
+          (5000, 999999, '5Genesis', 50, 0); -- a later snapshot must not be applied
+        INSERT INTO silver_transfers VALUES (100, 0, 86400000, '5Genesis', '5Bob', 400);
+      `);
+      return (await connection.run(entry.sql)).getRows();
+    });
+
+    expect(rows.map((r) => [String(r[0]), Number(r[1]), Number(r[2])])).toEqual([
+      ["5Bob", 86400000, 400],
+      ["5Genesis", 0, 1000],
+      ["5Genesis", 86400000, 600], // v2 would have reported -400
     ]);
   });
 
@@ -119,6 +164,7 @@ describe("account_balances_daily registry SQL", () => {
           kind VARCHAR, coldkey VARCHAR, amount_rao BIGINT
         );
       `);
+      await connection.run(SNAPSHOTS_TABLE);
       const result = await connection.run(entry.sql);
       return result.getRows();
     });

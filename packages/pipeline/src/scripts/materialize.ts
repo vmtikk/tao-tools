@@ -1,6 +1,7 @@
 import { loadEnvFile } from "@tao-tools/ingest";
 import { materializeSilverOhlcv } from "../silver/materializeOhlcv.js";
 import { materializeSilverGoogleTrends } from "../silver/materializeGoogleTrends.js";
+import { materializeSilverAccountSnapshots } from "../silver/materializeAccountSnapshots.js";
 import { materializeGold } from "../gold/materialize.js";
 
 async function main(): Promise<void> {
@@ -20,6 +21,13 @@ async function main(): Promise<void> {
     console.log(`Silver: ${trendsSilver.rowCount} rows -> ${trendsSilver.destination}`);
   } else {
     console.log("Silver: no Google Trends bronze found yet, skipping (run `pnpm trends:backfill` first)");
+  }
+
+  const snapshotsSilver = await materializeSilverAccountSnapshots();
+  if (snapshotsSilver) {
+    console.log(`Silver: ${snapshotsSilver.rowCount} rows -> ${snapshotsSilver.destination}`);
+  } else {
+    console.log("Silver: no account-snapshot bronze found yet, skipping (run `chain:snapshot-accounts` first)");
   }
 
   const gold = await materializeGold();

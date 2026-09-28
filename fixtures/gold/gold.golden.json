@@ -52,7 +52,7 @@
     },
     {
       "metric": "wallet_count_free_balance",
-      "version": 1,
+      "version": 2,
       "points": [
         {
           "timestampMs": 1769990400000,
@@ -62,7 +62,7 @@
     },
     {
       "metric": "wallet_count_dust_filtered",
-      "version": 1,
+      "version": 2,
       "points": [
         {
           "timestampMs": 1769990400000,
@@ -77,7 +77,7 @@
     },
     {
       "metric": "exchange_balances_daily",
-      "version": 1,
+      "version": 2,
       "points": []
     }
   ]

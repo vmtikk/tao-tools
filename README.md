@@ -89,6 +89,12 @@ same as chain bronze always did.
    `page.tsx`'s subtitle and caveat text updated to say so explicitly, and to state the currency
    (USD) directly rather than only implying it via venue names.
 
+**Update 2026-09-28: Phase 3 is no longer provisional.** The first full `chain:reconcile-checkpoints`
+run reconciled the fold against real on-chain balances to within dust, and seeding it with the
+genesis snapshot removed every negative balance — see "Full genesis-to-head run done" and "Genesis
+seed" in the reconciliation section below. The rest of this paragraph is the earlier status, kept
+for history.
+
 **Phase 3's numbers are still provisional, and this is the one thing blocking the project.**
 `chain:reconcile-checkpoints` has never completed against real chain data — only against fixtures
 — so nothing in the fold has been checked against on-chain ground truth. There is now concrete
@@ -671,13 +677,28 @@ surface:
   storage type. Reconciliation compares against **free + reserved**: the fold never sees free <->
   reserved moves (identity deposits, registrations...), so the total is what it actually tracks.
 
-What this does and doesn't settle for Phase 3: reconciliation seeds each coldkey from a real on-chain
-read the first time it's touched, so it proves the *event set* is complete (to dust). It does not
-fix `account_balances_daily`, which folds from zero with no such baseline and still shows ~117K
-negative-balance rows across ~10.6K coldkeys. Given every window reconciles, those negatives should
-come from balances that existed before a coldkey's first event, most likely accounts endowed directly
-in genesis state (Finney launched with balances carried over from the previous network). Seeding
-the fold from a genesis `System.Account` snapshot is the likely fix; not built yet.
+Reconciliation seeds each coldkey from a real on-chain read the first time it's touched, so it proves
+the *event set* complete (to dust) but didn't by itself fix `account_balances_daily`, which folded
+from zero and showed ~117K negative-balance rows across ~10.6K coldkeys.
+
+**Genesis seed (2026-09-28): negatives gone.** Finney launched with **18,619 accounts holding ~1.82M
+TAO directly in genesis state**, and no event ever credits those. `chain:snapshot-accounts`
+(`packages/ingest`, `SNAPSHOT_BLOCK` default 0) lists every `System.Account` key at the block and
+fetches the values in batches (59 RPC calls for genesis) into
+`bronze/chain/account_snapshots/{block}.parquet`, raw. `pipeline:materialize` decodes it to
+`silver/account_snapshots.parquet` (free + reserved, against that block's metadata), and
+`account_balances_daily` v3 adds each coldkey's block-0 balance as its first delta. Before building
+it, every one of the 10,581 still-negative coldkeys was checked to be a genesis account whose seed
+brings it back to >= 0; after the rebuild there are **0 negative rows**, the exchange-balance
+series never drops below 37,062 TAO (was -9,154.6), and the wallet count starts at **18,607** on
+genesis day instead of 8. It then drops to 14,282 the next day, which is real: 4,392 genesis dust
+wallets (median ~0.001 TAO, 320 TAO total) were emptied on 2023-03-21, 4,370 of them into one
+address (`5EsyFE...gq1`), each paying a fee and having its last few rao reaped. `wallet_count_*` and
+`exchange_balances_daily` got a version bump for the changed input (definitions unchanged).
+
+With the event set reconciled and the genesis baseline in, **Phase 3's wallet counts and exchange
+balances are no longer provisional** — the remaining known error is the ~0.005 TAO of dust
+mismatches above. Wallet-count series 2 (stake > 0) is still unbuilt.
 
 ### Sharded gold metrics (`shard_by`)
 

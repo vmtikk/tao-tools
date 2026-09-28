@@ -643,7 +643,9 @@ checkpoints" clause is still outstanding.)
 3. ✅ **Run for real 2026-09-28: the fold reconciles** — 42 windows, genesis to 9,072,000, 319
    dust-sized mismatches out of ~1.23M coldkey checks (largest 0.0095 TAO, net 0.005 TAO), all after
    block 4.97M. See the README's "Full genesis-to-head run done" for the three reconciler fixes it
-   took and what it does and doesn't settle for `account_balances_daily`. Earlier status, kept for
+   took. Same day, `account_balances_daily` v3 seeded the fold with a genesis `System.Account`
+   snapshot (18,619 accounts, ~1.82M TAO), which removed all ~117K negative-balance rows; Phase 3's
+   wallet counts and exchange balances are no longer provisional (README, "Genesis seed"). Earlier status, kept for
    history: **Sized 2026-09-09, not yet run — now the only remaining step.** Run `chain:reconcile-checkpoints`
    with `UP_TO_BLOCK=8929643` (silver now covers the full range, so the old "once it's caught back up"
    caveat is gone). Three real-data attempts on 2026-09-05 all failed before reaching a verdict (see

@@ -248,9 +248,11 @@
     - v1: "initial (2026-09-27), split out of transfer_count_daily v3"
 
 - name: account_balances_daily
-  version: 2
+  version: 3
   definition: >
-    Per-coldkey free balance (rao) at the end of each UTC day, one row per
+    Per-coldkey balance (rao, free + reserved; the fold can't see moves
+    between the two) at the end of each UTC day, seeded with each coldkey's
+    genesis balance from silver_account_snapshots (block 0), one row per
     (coldkey, day) that had at least one balance-affecting event that day —
     NOT forward-filled to every calendar day (§7.1: "reconstruct balances
     locally for every day", but density here is bounded by activity, not by
@@ -284,6 +286,10 @@
       SELECT coldkey, block_number, event_index, timestamp_ms,
              CASE kind WHEN 'deposit' THEN amount_rao ELSE -amount_rao END AS delta_rao
       FROM silver_balance_events
+      UNION ALL
+      SELECT coldkey, block_number, -1 AS event_index, timestamp_ms, free_rao + reserved_rao AS delta_rao
+      FROM silver_account_snapshots
+      WHERE block_number = 0 AND timestamp_ms IS NOT NULL AND free_rao + reserved_rao <> 0
     ),
     daily AS (
       SELECT coldkey,
@@ -319,9 +325,21 @@
         all transfer legs (~91M rows) and cannot be split across shards, so
         its single partition ran 4+ hours without finishing; under v2 it
         collapses to ~91 daily rows and completes in ~3s.
+    - v3: >
+        Seeds each coldkey with its genesis balance (2026-09-28). Finney launched
+        with 18,619 accounts holding ~1.82M TAO directly in genesis state, and no
+        event ever credits those, so v2 started them at zero: 10,620 coldkeys went
+        negative as soon as they spent, and wallet counts started at 8 instead of
+        ~18.6K. The first full chain reconciliation proved the event set complete
+        (to dust), and all 10,581 coldkeys still negative on the rebuilt silver
+        were genesis accounts that the seed brings back to >= 0. Only the block-0
+        snapshot seeds the fold: a later snapshot would double-count every event
+        already applied up to it. Also restates
+        the balance as free + reserved: the fold never sees free <-> reserved
+        moves, so that total is what it has always actually tracked.
 
 - name: wallet_count_free_balance
-  version: 1
+  version: 2
   definition: >
     Daily count of distinct coldkeys with free balance > 0 (§7.1 series 1) —
     includes dust and airdrop noise, unlike wallet_count_dust_filtered.
@@ -386,9 +404,10 @@
     ORDER BY timestamp_ms
   changelog:
     - v1: initial (Phase 3.1)
+    - v2: "input change only, definition unchanged (2026-09-28): account_balances_daily v3 now seeds genesis balances (18,619 accounts, ~1.82M TAO endowed directly in genesis state) and counts free + reserved. Values move a lot — the series now starts near 18.6K wallets instead of 8, and no coldkey goes negative — so the version is bumped to keep old and new numbers distinguishable."
 
 - name: wallet_count_dust_filtered
-  version: 1
+  version: 2
   definition: >
     Daily count of distinct coldkeys with free balance > 0.01 TAO (§7.1
     series 3) — strips airdrop and dust noise out of wallet_count_free_balance.
@@ -447,6 +466,7 @@
     ORDER BY timestamp_ms
   changelog:
     - v1: initial (Phase 3.1)
+    - v2: "input change only, definition unchanged (2026-09-28): account_balances_daily v3 now seeds genesis balances (18,619 accounts, ~1.82M TAO endowed directly in genesis state) and counts free + reserved. Values move a lot — the series now starts near 18.6K wallets instead of 8, and no coldkey goes negative — so the version is bumped to keep old and new numbers distinguishable."
 
 - name: social_trends_bittensor_weekly
   version: 1
@@ -473,7 +493,7 @@
     - v1: "initial (2026-09-10) — first social-metrics gold series; a future YouTube view/subscriber metric will be a separate series, not folded into this one"
 
 - name: exchange_balances_daily
-  version: 1
+  version: 2
   definition: >
     "TAO on exchanges" (§7.2) — total free balance, in TAO (not rao), held across every coldkey in
     data/meta/exchange_labels.json, per UTC day, forward-filled across the full account_balances_daily
@@ -531,3 +551,4 @@
     ORDER BY timestamp_ms
   changelog:
     - v1: initial (Phase 3.3)
+    - v2: "input change only, definition unchanged (2026-09-28): account_balances_daily v3 now seeds genesis balances (18,619 accounts, ~1.82M TAO endowed directly in genesis state) and counts free + reserved. Values move a lot — the series now starts near 18.6K wallets instead of 8, and no coldkey goes negative — so the version is bumped to keep old and new numbers distinguishable."

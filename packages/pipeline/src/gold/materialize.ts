@@ -49,6 +49,7 @@ const SILVER_SHARD_KEY_COLUMNS: Record<string, Record<string, string[]>> = {
   coldkey: {
     silver_transfers: ["from_coldkey", "to_coldkey"],
     silver_balance_events: ["coldkey"],
+    silver_account_snapshots: ["coldkey"],
   },
 };
 
@@ -65,6 +66,7 @@ interface ShardSpec {
 const SILVER_VIEW_FILES: Record<string, string> = {
   silver_transfers: "transfers.parquet",
   silver_balance_events: "balance_events.parquet",
+  silver_account_snapshots: "account_snapshots.parquet",
   silver_ohlcv_1m: "ohlcv_1m.parquet",
 };
 
@@ -219,6 +221,25 @@ export async function materializeGold(registryPath?: string): Promise<Materializ
               CAST(NULL AS VARCHAR) AS kind,
               CAST(NULL AS VARCHAR) AS coldkey,
               CAST(NULL AS BIGINT) AS amount_rao
+            WHERE FALSE;
+          `);
+        }
+
+        // Optional like balance_events: no snapshot yet is a valid empty set.
+        const snapshotsPath = `${silverDir()}/account_snapshots.parquet`;
+        if (existsSync(snapshotsPath)) {
+          await connection.run(
+            `CREATE OR REPLACE VIEW silver_account_snapshots AS SELECT * FROM read_parquet('${escapeSqlLiteral(snapshotsPath)}')${whereFor("silver_account_snapshots")};`,
+          );
+        } else {
+          await connection.run(`
+            CREATE OR REPLACE VIEW silver_account_snapshots AS
+            SELECT
+              CAST(NULL AS BIGINT) AS block_number,
+              CAST(NULL AS BIGINT) AS timestamp_ms,
+              CAST(NULL AS VARCHAR) AS coldkey,
+              CAST(NULL AS BIGINT) AS free_rao,
+              CAST(NULL AS BIGINT) AS reserved_rao
             WHERE FALSE;
           `);
         }
