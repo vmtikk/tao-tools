@@ -632,8 +632,9 @@ checkpoints" clause is still outstanding.)
    Cost ~26.8M RPC calls at a measured 3.0 calls/block; see §4.2's "Measured on Pro" note for what
    that implies about RU pricing and why it outran a monthly quota partway.
 2. ✅ **Done 2026-09-08** — `chain:materialize-silver` has decoded the whole range: 102,358,339
-   transfers, 235,553,651 balance events, 3,306,536 stake events, with 2 blocks skipped on decode
-   failure (logged to `data/meta/materialize_silver_skipped_blocks.jsonl`). Two things were found
+   transfers, 235,553,651 balance events, 3,306,536 stake events, with 16 blocks (not 2, as first
+   recorded) skipped on decode failure — all runtime-upgrade blocks decoded with the wrong metadata,
+   fixed and repaired 2026-09-28 (README, "Runtime-upgrade blocks"). Two things were found
    and fixed getting there, both worth knowing before the next long local run — see the README's
    "Decoding bronze -> silver at full scale": the resume path was **not idempotent** and had
    silently duplicated one batch into silver (1,447 duplicate transfer rows in blocks

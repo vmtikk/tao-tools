@@ -53,10 +53,12 @@ describe("materializeChainSilver (batched)", () => {
   });
 
   it("visits every block across batch boundaries, not just the first/last batch", async () => {
-    // 10 blocks; block 7 is deliberately stamped with a spec_version that has
-    // no matching bronze metadata. With batchBlocks=3, block 7 falls in the
-    // third batch ([7,9]) — a batching bug that skipped or mis-ranged a
-    // middle batch would silently miss this and not throw.
+    // 10 blocks; blocks 7-10 are stamped with a spec_version that has no
+    // matching bronze metadata. Block 7 is the upgrade block, so it decodes
+    // with the previous version (101); block 8 is the first to need 999. With
+    // batchBlocks=3, block 8 falls in the third batch ([7,9]) — a batching bug
+    // that skipped or mis-ranged a middle batch would silently miss this and
+    // not throw.
     await writeChainMetadataBronze({ specVersion: 101, metadataHex: metadataFixture.metadataHex, capturedAtBlock: 1 });
 
     await writeChainEventsBronze({
@@ -65,15 +67,14 @@ describe("materializeChainSilver (batched)", () => {
       toBlock: 6,
       specVersion: 101,
     });
-    await writeChainEventsBronze({ records: [emptyRecord(7)], fromBlock: 7, toBlock: 7, specVersion: 999 });
     await writeChainEventsBronze({
-      records: [8, 9, 10].map(emptyRecord),
-      fromBlock: 8,
+      records: [7, 8, 9, 10].map(emptyRecord),
+      fromBlock: 7,
       toBlock: 10,
-      specVersion: 101,
+      specVersion: 999,
     });
 
-    await expect(materializeChainSilver({ batchBlocks: 3 })).rejects.toThrow(/spec_version 999.*block 7/);
+    await expect(materializeChainSilver({ batchBlocks: 3 })).rejects.toThrow(/spec_version 999.*block 8/);
   });
 
   it("produces complete, correct output when everything decodes cleanly across multiple batches", async () => {

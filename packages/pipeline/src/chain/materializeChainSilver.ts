@@ -9,6 +9,7 @@ import {
 } from "./materializeSilverCheckpoint.js";
 import { appendSkippedBlock } from "./skippedBlocksLog.js";
 import type { TypeRegistry } from "@polkadot/types";
+import type { DuckDBConnection } from "@duckdb/node-api";
 
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -97,6 +98,154 @@ export interface MaterializeChainSilverOptions {
   parquetFlushIntervalBatches?: number;
 }
 
+/**
+ * Which metadata to decode each block's events with, derived once from the
+ * whole of bronze.
+ *
+ * Bronze's `spec_version` is `state_getRuntimeVersion` at the block's hash,
+ * i.e. the runtime *after* the block executed. That's the right version for
+ * every block except a runtime-upgrade block: its events were emitted by the
+ * old runtime (new code only runs from the next block), so it must decode
+ * with the previous block's version. Found for real (2026-09-28): 16 of the
+ * chain's upgrade blocks failed to decode against their stamped version and
+ * decoded cleanly against the previous one; the other upgrade blocks only
+ * decoded because the relevant types happened not to change.
+ *
+ * Duplicate bronze rows for a block (overlapping manual/sample ingests)
+ * always carry identical events bytes, but can disagree on the stamp: the
+ * Phase 2.1 tracer bullet stamped blocks 1-1000 all as 101, while the
+ * upgrade-aware backfill correctly stamps 561+ as 102. The highest stamp
+ * wins, deterministically.
+ */
+export interface DecodeSpecPlan {
+  /** Runtime-transition block -> the previous block's (canonical) spec_version. */
+  previousSpecAtTransition: Map<number, number>;
+  /** Blocks whose duplicate bronze rows disagree on spec_version. */
+  conflictingBlocks: number[];
+}
+
+export async function loadDecodeSpecPlan(connection: DuckDBConnection, eventsGlob: string): Promise<DecodeSpecPlan> {
+  const rows = await connection
+    .run(
+      `WITH canonical AS (
+         SELECT block_number, MAX(spec_version) AS spec_version, COUNT(DISTINCT spec_version) AS stamps
+         FROM read_parquet('${escapeSqlLiteral(eventsGlob)}')
+         GROUP BY block_number
+       ),
+       ordered AS (
+         SELECT block_number, spec_version, stamps,
+                LAG(spec_version) OVER (ORDER BY block_number) AS prev_spec
+         FROM canonical
+       )
+       SELECT block_number, spec_version, prev_spec, stamps
+       FROM ordered
+       WHERE (prev_spec IS NOT NULL AND prev_spec <> spec_version) OR stamps > 1
+       ORDER BY block_number;`,
+    )
+    .then((r) => r.getRows());
+
+  const previousSpecAtTransition = new Map<number, number>();
+  const conflictingBlocks: number[] = [];
+  for (const row of rows) {
+    const blockNumber = Number(row[0]);
+    const spec = Number(row[1]);
+    const prevSpec = row[2] == null ? null : Number(row[2]);
+    if (prevSpec !== null && prevSpec !== spec) {
+      // spec_version can't decrease on-chain, so a decrease means bad stamps
+      // in bronze — decoding around it would silently use wrong metadata.
+      if (spec < prevSpec) {
+        throw new Error(
+          `Bronze spec_version goes backwards at block ${blockNumber} (${prevSpec} -> ${spec}); ` +
+            "bronze stamps are inconsistent, refusing to guess which metadata to decode with.",
+        );
+      }
+      previousSpecAtTransition.set(blockNumber, prevSpec);
+    }
+    if (Number(row[3]) > 1) conflictingBlocks.push(blockNumber);
+  }
+  return { previousSpecAtTransition, conflictingBlocks };
+}
+
+/** Bronze rows for the given block filter, one per block (see DecodeSpecPlan for the MAX). */
+function bronzeBlocksQuery(eventsGlob: string, whereClause: string): string {
+  return `SELECT block_number, any_value(events_hex), any_value(timestamp_hex), MAX(spec_version)
+          FROM read_parquet('${escapeSqlLiteral(eventsGlob)}')
+          WHERE ${whereClause}
+          GROUP BY block_number
+          ORDER BY block_number;`;
+}
+
+interface DecodedBlockRows {
+  transferValues: string[];
+  balanceEventValues: string[];
+  stakeEventValues: string[];
+}
+
+/** Decodes one bronze block into SQL VALUES tuples for the three silver tables. Throws on decode failure. */
+function decodeBlockRows(
+  registry: TypeRegistry,
+  blockNumber: number,
+  eventsHex: string,
+  timestampHex: string | null,
+): DecodedBlockRows {
+  const timestampMs = decodeTimestamp(registry, timestampHex);
+  const { balanceEvents, stakeEvents } = decodeChainEventsForBlock(registry, eventsHex, blockNumber);
+  const out: DecodedBlockRows = { transferValues: [], balanceEventValues: [], stakeEventValues: [] };
+  for (const event of balanceEvents) {
+    if (event.kind === "transfer") {
+      out.transferValues.push(
+        `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
+          `'${escapeSqlLiteral(event.from)}', '${escapeSqlLiteral(event.to)}', ${event.amount})`,
+      );
+    } else {
+      out.balanceEventValues.push(
+        `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
+          `'${event.kind}', '${escapeSqlLiteral(event.coldkey)}', ${event.amount})`,
+      );
+    }
+  }
+  for (const event of stakeEvents) {
+    out.stakeEventValues.push(
+      `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
+        `'${event.kind}', '${escapeSqlLiteral(event.hotkey)}', ${event.amount})`,
+    );
+  }
+  return out;
+}
+
+function registryFor(
+  registryBySpecVersion: Map<number, TypeRegistry>,
+  plan: DecodeSpecPlan,
+  blockNumber: number,
+  stampedSpec: number,
+): { registry: TypeRegistry; decodeSpec: number } {
+  const decodeSpec = plan.previousSpecAtTransition.get(blockNumber) ?? stampedSpec;
+  const registry = registryBySpecVersion.get(decodeSpec);
+  if (!registry) {
+    throw new Error(`No bronze chain/metadata for spec_version ${decodeSpec} (block ${blockNumber})`);
+  }
+  return { registry, decodeSpec };
+}
+
+async function loadRegistries(connection: DuckDBConnection, metadataGlob: string): Promise<Map<number, TypeRegistry>> {
+  const metaRows = await connection
+    .run(`SELECT spec_version, metadata_hex FROM read_parquet('${escapeSqlLiteral(metadataGlob)}');`)
+    .then((r) => r.getRows());
+  const registryBySpecVersion = new Map<number, TypeRegistry>();
+  for (const row of metaRows) {
+    registryBySpecVersion.set(Number(row[0]), buildRegistry(String(row[1])));
+  }
+  return registryBySpecVersion;
+}
+
+async function exportSilverParquet(connection: DuckDBConnection): Promise<void> {
+  for (const table of ["transfers", "balance_events", "stake_events"]) {
+    await connection.run(
+      `COPY ${table} TO '${escapeSqlLiteral(`${silverDir()}/${table}.parquet`)}' (FORMAT PARQUET, COMPRESSION ZSTD);`,
+    );
+  }
+}
+
 export async function materializeChainSilver(opts: MaterializeChainSilverOptions = {}): Promise<MaterializeChainSilverResult> {
   const batchBlocks = opts.batchBlocks ?? BATCH_BLOCKS;
   const resumable = opts.resumable ?? false;
@@ -118,14 +267,8 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
   const attempt = () =>
     withDuckDb(
       async (connection) => {
-      const metaResult = await connection.run(
-        `SELECT spec_version, metadata_hex FROM read_parquet('${escapeSqlLiteral(metadataGlob)}');`,
-      );
-      const metaRows = await metaResult.getRows();
-      const registryBySpecVersion = new Map<number, TypeRegistry>();
-      for (const row of metaRows) {
-        registryBySpecVersion.set(Number(row[0]), buildRegistry(String(row[1])));
-      }
+      const registryBySpecVersion = await loadRegistries(connection, metadataGlob);
+      const plan = await loadDecodeSpecPlan(connection, eventsGlob);
 
       const rangeResult = await connection.run(
         `SELECT MIN(block_number), MAX(block_number) FROM read_parquet('${escapeSqlLiteral(eventsGlob)}');`,
@@ -166,15 +309,7 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
       // millions more decoded blocks. Phase 3 work explicitly wants to
       // build against "whatever prefix is done so far" (§6), which only
       // works if the exported parquet actually reflects that prefix.
-      const flushToParquet = async () => {
-        await connection.run(`COPY transfers TO '${escapeSqlLiteral(transfersDestination)}' (FORMAT PARQUET, COMPRESSION ZSTD);`);
-        await connection.run(
-          `COPY balance_events TO '${escapeSqlLiteral(balanceEventsDestination)}' (FORMAT PARQUET, COMPRESSION ZSTD);`,
-        );
-        await connection.run(
-          `COPY stake_events TO '${escapeSqlLiteral(stakeEventsDestination)}' (FORMAT PARQUET, COMPRESSION ZSTD);`,
-        );
-      };
+      const flushToParquet = () => exportSilverParquet(connection);
 
       if (minBlock !== null && maxBlock !== null) {
         // A checkpoint claiming progress is only trustworthy if the staging
@@ -227,18 +362,12 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
           // the RU-sizing samples near block 8.9M — tao-analytics-plan.md
           // §4.2's "Findings") and the real backfill's later sweep over the
           // same range both persist forever, as two separate rows for the
-          // same block_number. Deduping here, not by refusing to write
-          // overlapping bronze, keeps that invariant intact while still
-          // decoding each block exactly once — found for real 2026-08-27:
-          // blocks 1-1000 each have 2 bronze rows.
-          const blockResult = await connection.run(
-            `SELECT block_number, events_hex, timestamp_hex, spec_version
-             FROM read_parquet('${escapeSqlLiteral(eventsGlob)}')
-             WHERE block_number BETWEEN ${batchStart} AND ${batchEnd}
-             QUALIFY ROW_NUMBER() OVER (PARTITION BY block_number ORDER BY block_number) = 1
-             ORDER BY block_number;`,
-          );
-          const blockRows = await blockResult.getRows();
+          // same block_number. Deduping here (see bronzeBlocksQuery), not by
+          // refusing to write overlapping bronze, keeps that invariant intact
+          // while still decoding each block exactly once.
+          const blockRows = await connection
+            .run(bronzeBlocksQuery(eventsGlob, `block_number BETWEEN ${batchStart} AND ${batchEnd}`))
+            .then((r) => r.getRows());
 
           const transferValues: string[] = [];
           const balanceEventValues: string[] = [];
@@ -246,55 +375,25 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
 
           for (const row of blockRows) {
             const blockNumber = Number(row[0]);
-            const eventsHex = String(row[1]);
-            const timestampHex = row[2] == null ? null : String(row[2]);
-            const specVersion = Number(row[3]);
-            const registry = registryBySpecVersion.get(specVersion);
-            if (!registry) {
-              throw new Error(`No bronze chain/metadata for spec_version ${specVersion} (block ${blockNumber})`);
-            }
-
-            let timestampMs: number | null;
-            let balanceEvents: ReturnType<typeof decodeChainEventsForBlock>["balanceEvents"];
-            let stakeEvents: ReturnType<typeof decodeChainEventsForBlock>["stakeEvents"];
+            const { registry, decodeSpec } = registryFor(registryBySpecVersion, plan, blockNumber, Number(row[3]));
+            let decoded: DecodedBlockRows;
             try {
-              timestampMs = decodeTimestamp(registry, timestampHex);
-              ({ balanceEvents, stakeEvents } = decodeChainEventsForBlock(registry, eventsHex, blockNumber));
+              decoded = decodeBlockRows(registry, blockNumber, String(row[1]), row[2] == null ? null : String(row[2]));
             } catch (err) {
-              // A single block's SCALE bytes failing to decode against
-              // metadata that's otherwise verified correct (found for real
-              // 2026-08-29: a runtime-upgrade-boundary block hit a genuine
-              // `@polkadot/types` decode misalignment — confirmed *not* a
-              // bronze/metadata/spec_version problem by comparing bronze's
-              // raw bytes, the cached metadata, and the spec_version stamp
-              // all against a fresh live read) must not halt the other
-              // ~8.9M blocks. It also must not vanish silently — logged
-              // durably via skippedBlocksLog.ts for later investigation.
+              // A single undecodable block must not halt the other ~9M, and
+              // must not vanish silently either — logged durably via
+              // skippedBlocksLog.ts. (Every skip before 2026-09-28 was a
+              // runtime-upgrade block decoded with the wrong metadata — see
+              // DecodeSpecPlan — not a genuine decoder misalignment.)
               const message = err instanceof Error ? err.message : String(err);
-              console.warn(`materializeChainSilver: skipping block ${blockNumber} (spec_version ${specVersion}) — decode failed: ${message}`);
-              appendSkippedBlock({ blockNumber, specVersion, error: message });
+              console.warn(`materializeChainSilver: skipping block ${blockNumber} (spec_version ${decodeSpec}) — decode failed: ${message}`);
+              appendSkippedBlock({ blockNumber, specVersion: decodeSpec, error: message });
               skippedBlocks.push(blockNumber);
               continue;
             }
-            for (const event of balanceEvents) {
-              if (event.kind === "transfer") {
-                transferValues.push(
-                  `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
-                    `'${escapeSqlLiteral(event.from)}', '${escapeSqlLiteral(event.to)}', ${event.amount})`,
-                );
-              } else {
-                balanceEventValues.push(
-                  `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
-                    `'${event.kind}', '${escapeSqlLiteral(event.coldkey)}', ${event.amount})`,
-                );
-              }
-            }
-            for (const event of stakeEvents) {
-              stakeEventValues.push(
-                `(${blockNumber}, ${event.eventIndex}, ${timestampMs ?? "NULL"}, ` +
-                  `'${event.kind}', '${escapeSqlLiteral(event.hotkey)}', ${event.amount})`,
-              );
-            }
+            transferValues.push(...decoded.transferValues);
+            balanceEventValues.push(...decoded.balanceEventValues);
+            stakeEventValues.push(...decoded.stakeEventValues);
           }
 
           if (transferValues.length > 0) {
@@ -431,4 +530,131 @@ export async function materializeChainSilver(opts: MaterializeChainSilverOptions
     clearMaterializeSilverCheckpoint();
     return await attempt();
   }
+}
+
+export interface RepairUpgradeBlocksResult {
+  repairedBlocks: number[];
+  /** Blocks whose decoded silver rows actually differ from what was there before. */
+  changedBlocks: { blockNumber: number; rowsBefore: number; rowsAfter: number }[];
+}
+
+/**
+ * Re-decodes, in the existing resumable staging DB, every block the pre-2026-09-28
+ * decoder could have decoded with the wrong metadata: each runtime-transition
+ * block, plus blocks whose duplicate bronze rows disagree on spec_version (see
+ * DecodeSpecPlan). A few hundred blocks, instead of a ~30h full rebuild.
+ *
+ * Strict where materializeChainSilver is lenient: every block must decode, and
+ * everything is decoded before anything is deleted, so a failure leaves the
+ * staging DB untouched. Only blocks the checkpoint says are already decoded are
+ * repaired; later ones get the fixed decoder when a normal run reaches them.
+ */
+export async function repairUpgradeBlocks(): Promise<RepairUpgradeBlocksResult> {
+  const bronzeUri = resolveBronzeUri();
+  const eventsGlob = `${bronzeUri}/chain/events/*.parquet`;
+  const metadataGlob = `${bronzeUri}/chain/metadata/*.parquet`;
+  const stagingDbPath = `${silverDir()}/.materialize_silver_staging.duckdb`;
+  if (!existsSync(stagingDbPath)) {
+    throw new Error(`No staging DB at ${stagingDbPath} — run chain:materialize-silver first.`);
+  }
+
+  return withDuckDb(
+    async (connection) => {
+      const minBlockRows = await connection
+        .run(`SELECT MIN(block_number) FROM read_parquet('${escapeSqlLiteral(eventsGlob)}');`)
+        .then((r) => r.getRows());
+      const checkpoint = readMaterializeSilverCheckpoint(Number(minBlockRows[0]?.[0]));
+      if (!checkpoint) {
+        throw new Error("No materialize-silver checkpoint matches this bronze — nothing decoded to repair.");
+      }
+
+      const registryBySpecVersion = await loadRegistries(connection, metadataGlob);
+      const plan = await loadDecodeSpecPlan(connection, eventsGlob);
+      const repairedBlocks = [...new Set([...plan.previousSpecAtTransition.keys(), ...plan.conflictingBlocks])]
+        .filter((b) => b <= checkpoint.lastCompletedBatchEnd)
+        .sort((a, b) => a - b);
+      if (repairedBlocks.length === 0) return { repairedBlocks, changedBlocks: [] };
+      const inList = repairedBlocks.join(",");
+
+      const blockRows = await connection
+        .run(bronzeBlocksQuery(eventsGlob, `block_number IN (${inList})`))
+        .then((r) => r.getRows());
+      if (blockRows.length !== repairedBlocks.length) {
+        throw new Error(`Expected ${repairedBlocks.length} bronze blocks to repair, found ${blockRows.length}.`);
+      }
+
+      const decodedByBlock = new Map<number, DecodedBlockRows>();
+      for (const row of blockRows) {
+        const blockNumber = Number(row[0]);
+        const { registry, decodeSpec } = registryFor(registryBySpecVersion, plan, blockNumber, Number(row[3]));
+        try {
+          decodedByBlock.set(
+            blockNumber,
+            decodeBlockRows(registry, blockNumber, String(row[1]), row[2] == null ? null : String(row[2])),
+          );
+        } catch (err) {
+          throw new Error(
+            `Block ${blockNumber} still fails to decode with spec_version ${decodeSpec}: ` +
+              `${err instanceof Error ? err.message : String(err)}. Staging DB left untouched.`,
+          );
+        }
+      }
+
+      const snapshot = async (): Promise<Map<number, string[]>> => {
+        const rows = await connection
+          .run(
+            `SELECT block_number, 't' || event_index || '|' || from_coldkey || '|' || to_coldkey || '|' || amount_rao || '|' || coalesce(timestamp_ms, -1) FROM transfers WHERE block_number IN (${inList})
+             UNION ALL
+             SELECT block_number, 'b' || event_index || '|' || kind || '|' || coldkey || '|' || amount_rao || '|' || coalesce(timestamp_ms, -1) FROM balance_events WHERE block_number IN (${inList})
+             UNION ALL
+             SELECT block_number, 's' || event_index || '|' || kind || '|' || hotkey || '|' || amount_rao || '|' || coalesce(timestamp_ms, -1) FROM stake_events WHERE block_number IN (${inList});`,
+          )
+          .then((r) => r.getRows());
+        const byBlock = new Map<number, string[]>();
+        for (const [block, key] of rows) {
+          const list = byBlock.get(Number(block)) ?? [];
+          list.push(String(key));
+          byBlock.set(Number(block), list);
+        }
+        for (const list of byBlock.values()) list.sort();
+        return byBlock;
+      };
+
+      const before = await snapshot();
+      await connection.run("BEGIN TRANSACTION;");
+      try {
+        for (const table of ["transfers", "balance_events", "stake_events"]) {
+          await connection.run(`DELETE FROM ${table} WHERE block_number IN (${inList});`);
+        }
+        const all = (pick: (d: DecodedBlockRows) => string[]) => [...decodedByBlock.values()].flatMap(pick);
+        const inserts: [string, string[]][] = [
+          ["transfers", all((d) => d.transferValues)],
+          ["balance_events", all((d) => d.balanceEventValues)],
+          ["stake_events", all((d) => d.stakeEventValues)],
+        ];
+        for (const [table, values] of inserts) {
+          if (values.length > 0) await connection.run(`INSERT INTO ${table} VALUES ${values.join(",")};`);
+        }
+        await connection.run("COMMIT;");
+      } catch (err) {
+        await connection.run("ROLLBACK;");
+        throw err;
+      }
+      const after = await snapshot();
+
+      const changedBlocks: RepairUpgradeBlocksResult["changedBlocks"] = [];
+      for (const blockNumber of repairedBlocks) {
+        const b = before.get(blockNumber) ?? [];
+        const a = after.get(blockNumber) ?? [];
+        if (b.length !== a.length || b.some((key, i) => key !== a[i])) {
+          changedBlocks.push({ blockNumber, rowsBefore: b.length, rowsAfter: a.length });
+        }
+      }
+
+      await connection.run("CHECKPOINT;");
+      await exportSilverParquet(connection);
+      return { repairedBlocks, changedBlocks };
+    },
+    { needsR2: bronzeUri.startsWith("s3://"), dbPath: stagingDbPath, memoryLimit: "2GB" },
+  );
 }

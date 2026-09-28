@@ -400,10 +400,11 @@ the script's call counter resets on every process start, so `backfill.log`'s clo
 calls" is just the final session — that one covered blocks 8,740,001–8,929,643. Multiply blocks by
 3 for the real figure, not the log line.) Decoded to silver 2026-09-08 — 102,358,339 transfers
 (after removing the 1,447 duplicates described below), 235,553,651 balance events, 3,306,536 stake
-events. Two blocks failed to decode and were skipped
-(logged to `data/meta/materialize_silver_skipped_blocks.jsonl`); that path is deliberate, see
-`materializeChainSilver`'s catch — a single block's SCALE bytes failing to decode must not halt
-the other 8.9M.
+events. That run actually skipped 16 blocks on decode failure (logged to
+`data/meta/materialize_silver_skipped_blocks.jsonl`), not the two this line used to say. All 16
+turned out to be runtime-upgrade blocks decoded with the wrong metadata, since fixed and repaired
+(2026-09-28, see "Runtime-upgrade blocks" below). The skip path itself is still deliberate, see
+`materializeChainSilver`'s catch: a single block failing to decode must not halt the other ~9M.
 
 Env vars: `FROM_BLOCK` (default 1), `TO_BLOCK` (default: live chain head), `CHAIN_CHUNK_BLOCKS`
 (default 100,000 — one bronze file per chunk, split further only at a runtime-upgrade boundary),
@@ -500,6 +501,29 @@ was built before `DustLost` was decoded, so `chain:materialize-silver` needs a f
 local-only, no RPC) before the full-range reconciliation reflects it. Until then, expect the full
 reconciliation run's mismatch count to be dominated by this now-fixed-in-code-but-not-yet-
 re-materialized gap, not by anything still genuinely wrong with the fold.
+
+**Runtime-upgrade blocks were decoded with the wrong metadata (found and fixed 2026-09-28).**
+Bronze stamps each block with `state_getRuntimeVersion` at that block's hash, which is the runtime
+*after* the block ran. That's right for every block except an upgrade block: its events were
+emitted by the old runtime, since new code only runs from the next block. So all 168 upgrade blocks
+were decoded one version too early. 16 of them failed outright and were skipped, silently dropping
+739 transfer/balance/stake rows from silver (up to 263 in one block). The other upgrade blocks only
+decoded because the relevant types happened not to change. A 2026-08-29 investigation had ruled
+this out because bronze's stamp matched a live read, but the live read reports the post-block
+runtime too. Also found: blocks 561-1000 have two bronze rows with different stamps (the Phase 2.1
+tracer bullet stamped all of 1-1000 as 101, the upgrade-aware backfill stamps 561+ as 102). Events
+bytes are identical across every one of the 45,003 duplicated blocks; only the stamp differs, and
+the decoder had been picking one of the duplicate rows arbitrarily.
+
+**Fix** (`DecodeSpecPlan` in `materializeChainSilver.ts`): a block's version is the highest stamp
+among its duplicate rows, and a runtime-transition block decodes with the previous block's version.
+A version that goes backwards fails loudly, since that can't happen on-chain. **Repair**:
+`pnpm --filter @tao-tools/pipeline run chain:repair-silver-upgrade-blocks` re-decodes just the
+affected blocks (transitions plus conflicting stamps, 607 in total) in the existing staging DB, in
+one transaction, decoding everything before deleting anything, then re-exports silver. On the real
+data it changed exactly the 16 previously-skipped blocks (0 rows each before) and left the other
+591 byte-identical, so no block had been silently mis-decoded. Covered by
+`materializeChainSilverUpgradeBlocks.test.ts`, using real mainnet block 720,235 (upgrade 122 -> 123).
 
 **Why the tail of the chain is so slow to decode, and why transfer counts exploded (2026-09-27).**
 The rebuild above ran at ~30s per 3,000-block batch until block 8,283,000, then stepped to
