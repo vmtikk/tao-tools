@@ -1,18 +1,9 @@
-import {
-  asBlockNumber,
-  asColdkey,
-  asRao,
-  reconstructBalances,
-  type BalanceEvent,
-  type BalanceMap,
-  type Coldkey,
-  type Rao,
-} from "@tao-tools/core";
+import { asColdkey, asRao, type BalanceEvent, type BalanceMap, type Coldkey, type Rao } from "@tao-tools/core";
 import { systemAccountKey, type BlockmachineClient } from "@tao-tools/ingest";
 import { withDuckDb } from "../duckdb/session.js";
 import { resolveBronzeUri, silverDir } from "../paths.js";
 import { buildRegistry } from "./decodeEvents.js";
-import { decodeFreeBalance } from "./decodeAccount.js";
+import { decodeAccountBalances } from "./decodeAccount.js";
 import { mapWithConcurrency } from "./concurrency.js";
 import type { TypeRegistry } from "@polkadot/types";
 
@@ -20,12 +11,28 @@ function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+/**
+ * Balances here are *total* (free + reserved), not free. The fold only sees
+ * Transfer/Deposit/Withdraw/DustLost; moving TAO between free and reserved
+ * (identity deposits, registrations, proxies...) changes neither, so what the
+ * fold reconstructs is the total. Comparing against free alone would flag
+ * every account holding a reserve. Mismatches against the total are genuine
+ * missing events: slashes, reserve repatriations, and the like.
+ */
 export interface ReconciliationRow {
   coldkey: Coldkey;
   baselineRao: bigint;
   reconstructedRao: bigint;
   actualRao: bigint;
+  /** Breakdown of `actualRao`, for diagnosing mismatches. */
+  actualFreeRao: bigint;
+  actualReservedRao: bigint;
   matches: boolean;
+}
+
+function totalBalance(registry: TypeRegistry, accountInfoHex: string | null): { free: bigint; reserved: bigint; total: bigint } {
+  const { free, reserved } = decodeAccountBalances(registry, accountInfoHex);
+  return { free, reserved, total: free + reserved };
 }
 
 export interface ReconcileBalancesResult {
@@ -36,81 +43,67 @@ export interface ReconcileBalancesResult {
   touchedAccounts: number;
   rows: ReconciliationRow[];
   /**
-   * Full balance state as of `toBlock`, covering every coldkey carried in
-   * via `knownGoodBalances` plus anything newly touched by this window's
-   * events. Pass this straight back in as the *next* checkpoint's
-   * `knownGoodBalances` — that's what makes consecutive checkpoints
-   * incremental instead of re-folding genesis-to-date every time.
+   * Balance state as of `toBlock` to carry into the next window: every
+   * coldkey from `knownGoodBalances`, with each coldkey touched here set to
+   * its *actual* on-chain balance just read, not the reconstructed one. That
+   * keeps windows independent: a gap in the fold shows up as a mismatch in
+   * the window where it happened, instead of cascading into every later one.
    */
   balances: BalanceMap;
 }
 
-/** Exported so a multi-checkpoint caller (`runReconciliationCheckpoints.ts`)
- * can load silver once and pass the same array to every checkpoint's
- * `reconcileBalances` call, instead of re-reading disk per checkpoint.
+/**
+ * Net change per coldkey over [fromBlock, toBlock]: transfers debit the
+ * sender and credit the recipient, deposits credit, withdraws debit. Every
+ * coldkey that appears in the window is present, even with a net change of 0
+ * (e.g. a self-transfer) — "touched" is what reconciliation checks.
  *
- * `maxBlock` (optional) pushes a `block_number <=` bound down into both SQL
- * queries so DuckDB never materializes rows past the caller's actual range
- * of interest — found for real (2026-09-05): unfiltered, this pulled the
- * *entire* silver history (~95M rows against a ~5.8M-block backfill prefix)
- * into memory regardless of `UP_TO_BLOCK`, OOMing even for a caller that only
- * wanted the first few checkpoints. */
-export async function loadEventsFromSilver(maxBlock?: number): Promise<BalanceEvent[]> {
-  const transfersPath = `${silverDir()}/transfers.parquet`;
-  const balanceEventsPath = `${silverDir()}/balance_events.parquet`;
-  const blockFilter = maxBlock !== undefined ? `WHERE block_number <= ${Math.trunc(maxBlock)}` : "";
-
-  return withDuckDb(
-    async (connection) => {
-      const events: BalanceEvent[] = [];
-
-      const transferRows = await connection
+ * Reconciliation only compares end-of-window balances, and the fold is plain
+ * unclamped addition, so the net sum is exactly what an event-by-event fold
+ * would end on — without holding the window's events in memory. The full
+ * index is ~370M events; the old approach (load all of them into one JS
+ * array, then copy the balance map per event) could not run at that scale.
+ */
+export async function loadWindowNetDeltasFromSilver(fromBlock: number, toBlock: number): Promise<Map<Coldkey, bigint>> {
+  const transfersPath = escapeSqlLiteral(`${silverDir()}/transfers.parquet`);
+  const balanceEventsPath = escapeSqlLiteral(`${silverDir()}/balance_events.parquet`);
+  const window = `block_number BETWEEN ${Math.trunc(fromBlock)} AND ${Math.trunc(toBlock)}`;
+  const rows = await withDuckDb(
+    async (connection) =>
+      connection
         .run(
-          `SELECT block_number, event_index, from_coldkey, to_coldkey, amount_rao
-           FROM read_parquet('${escapeSqlLiteral(transfersPath)}')
-           ${blockFilter}
-           ORDER BY block_number, event_index;`,
+          `WITH deltas AS (
+             SELECT from_coldkey AS coldkey, -amount_rao AS delta FROM read_parquet('${transfersPath}') WHERE ${window}
+             UNION ALL
+             SELECT to_coldkey, amount_rao FROM read_parquet('${transfersPath}') WHERE ${window}
+             UNION ALL
+             SELECT coldkey, CASE kind WHEN 'deposit' THEN amount_rao ELSE -amount_rao END
+             FROM read_parquet('${balanceEventsPath}') WHERE ${window}
+           )
+           SELECT coldkey, CAST(SUM(delta) AS BIGINT) FROM deltas GROUP BY coldkey;`,
         )
-        .then((r) => r.getRows());
-      for (const row of transferRows) {
-        events.push({
-          kind: "transfer",
-          blockNumber: asBlockNumber(Number(row[0])),
-          eventIndex: Number(row[1]),
-          from: asColdkey(String(row[2])),
-          to: asColdkey(String(row[3])),
-          amount: asRao(BigInt(row[4] as bigint)),
-        });
-      }
-
-      const balanceEventRows = await connection
-        .run(
-          `SELECT block_number, event_index, kind, coldkey, amount_rao
-           FROM read_parquet('${escapeSqlLiteral(balanceEventsPath)}')
-           ${blockFilter}
-           ORDER BY block_number, event_index;`,
-        )
-        .then((r) => r.getRows());
-      for (const row of balanceEventRows) {
-        const kind = String(row[2]) as "deposit" | "withdraw";
-        events.push({
-          kind,
-          blockNumber: asBlockNumber(Number(row[0])),
-          eventIndex: Number(row[1]),
-          coldkey: asColdkey(String(row[3])),
-          amount: asRao(BigInt(row[4] as bigint)),
-        });
-      }
-
-      events.sort((a, b) => a.blockNumber - b.blockNumber || a.eventIndex - b.eventIndex);
-      return events;
-    },
+        .then((r) => r.getRows()),
     // See session.ts's memoryLimit doc comment: DuckDB auto-sizes its buffer
-    // pool against *total* system RAM, which is too optimistic when other
-    // processes (chain:backfill, materialize-silver) already hold a lot of
-    // it — found for real 2026-09-05 running this against ~95M real events.
+    // pool against total system RAM, too optimistic alongside other jobs.
     { memoryLimit: "3GB" },
   );
+  return new Map(rows.map((row) => [asColdkey(String(row[0])), BigInt(row[1] as bigint)]));
+}
+
+/** Same as {@link loadWindowNetDeltasFromSilver}, over an in-memory event list (tests, small ranges). */
+export function netDeltasFromEvents(events: readonly BalanceEvent[], fromBlock: number, toBlock: number): Map<Coldkey, bigint> {
+  const deltas = new Map<Coldkey, bigint>();
+  const add = (coldkey: Coldkey, amount: bigint) => deltas.set(coldkey, (deltas.get(coldkey) ?? 0n) + amount);
+  for (const event of events) {
+    if (event.blockNumber < fromBlock || event.blockNumber > toBlock) continue;
+    if (event.kind === "transfer") {
+      add(event.from, -event.amount);
+      add(event.to, event.amount);
+    } else {
+      add(event.coldkey, event.kind === "deposit" ? event.amount : -event.amount);
+    }
+  }
+  return deltas;
 }
 
 async function loadRegistryForBlock(client: BlockmachineClient, blockHash: string): Promise<TypeRegistry> {
@@ -144,51 +137,38 @@ async function loadRegistryForBlock(client: BlockmachineClient, blockHash: strin
 }
 
 /**
- * tao-analytics-plan.md §6, Phase 2.2: folds silver balance events for
- * [fromBlock, toBlock] into a `BalanceMap` (§7.1's reducer) and reconciles
+ * tao-analytics-plan.md §6, Phase 2.2: applies each coldkey's net change over
+ * [fromBlock, toBlock] to its balance at the window's start, and reconciles
  * each coldkey touched in that window against a real `System.Account` read
  * at the window's end block. "If reconstructed != actual, the fold is wrong
  * and it is 1,000 blocks of debugging, not 8.9M" — this is that debugging
  * tool, not a one-shot assertion: it reports every mismatch, not just
  * whether any exist.
  *
- * **Events are filtered to the window** (`fromBlock <= blockNumber <=
- * toBlock`) before folding — this was not true of the original Phase 2.2
- * version, which folded *every* event currently in silver regardless of the
- * requested range. That was invisible as a bug as long as every call started
- * at genesis (fromBlock=1, where "everything before fromBlock" is empty by
- * definition), but folding the full history on top of a `knownGoodBalances`/
- * on-chain baseline already representing state as of `fromBlock - 1` would
- * double-count every event before `fromBlock` for any later window — exactly
- * what `runReconciliationCheckpoints.ts`'s incremental, non-genesis windows
- * need not to happen.
+ * **Only the window's own events count.** A later window's starting point
+ * already reflects everything before `fromBlock` (a carried-forward balance
+ * or an on-chain read at `fromBlock - 1`), so including earlier events would
+ * double-count them — the original Phase 2.2 bug, invisible while every call
+ * started at genesis.
  *
- * **`knownGoodBalances` (optional) carries forward a previously-validated
- * state** instead of re-fetching a real on-chain baseline for coldkeys
- * already reconciled in an earlier checkpoint — the efficiency half of
- * "checkpoint," not just correctness: only coldkeys newly touched in *this*
- * window need a fresh `System.Account` read. Coldkeys absent from both the
- * window's events and `knownGoodBalances` were never touched at all, by
- * definition, and don't need one either — same reasoning `runReconciliation
- * Checkpoints.ts` relies on to skip most of the ledger, most checkpoints.
+ * **`knownGoodBalances` (optional) carries forward balances from an earlier
+ * window** instead of re-reading them on-chain — only coldkeys touched here
+ * for the first time need a fresh `System.Account` read at `fromBlock - 1`.
+ * Coldkeys absent from both the window and `knownGoodBalances` were never
+ * touched and need no read at all.
  *
- * The very first window (whatever its `fromBlock`) still needs a real
- * on-chain baseline for anything newly touched — that's what surfaced the
- * genesis-funded-accounts gap originally: several coldkeys were pre-funded
- * directly in genesis state, present in `System.Account` at block 0 with no
- * `Balances.Deposit` event ever emitted for it (genesis state is constructed
- * directly, not by executing block 1). A fold seeded from zero can never
- * reconcile that — it isn't a bug in the fold, it's a baseline problem, and
- * it generalizes: any coldkey touched for the first time in a window needs a
- * real snapshot at that window's start, not an assumed zero.
+ * That start-of-window read is also what handles genesis-funded accounts:
+ * several coldkeys held TAO at block 0 with no `Balances.Deposit` ever
+ * emitted (genesis state is constructed directly), which a fold seeded from
+ * zero can never reconcile. Any coldkey touched for the first time needs a
+ * real snapshot at its first window's start, not an assumed zero.
  */
 export async function reconcileBalances(opts: {
   fromBlock: number;
   toBlock: number;
   client: BlockmachineClient;
   knownGoodBalances?: BalanceMap;
-  /** Pre-loaded events, so a multi-checkpoint caller can load silver once
-   * instead of once per checkpoint. Defaults to a fresh read from silver. */
+  /** In-memory events instead of reading the window from silver (tests, small ranges). */
   events?: readonly BalanceEvent[];
   /**
    * Coldkeys in flight at once for each of this function's two
@@ -198,27 +178,15 @@ export async function reconcileBalances(opts: {
    * Exists for the same reason `chain:backfill`'s `CHAIN_CONCURRENCY` does
    * (see `fetchBlockRange.ts`): a sequential loop here is latency-bound at
    * ~270ms/call RTT, not rate-limit-bound, so `CHAIN_MAX_RPM` alone can't
-   * make a real reconciliation run fast — measured to project to ~5 days of
-   * wall-clock time at concurrency 1 for the full genesis-to-head range's
-   * ~1.67M calls, versus ~4 hours at the backfill's own measured ~110-120
-   * calls/s ceiling.
+   * make a real reconciliation run fast.
    */
   concurrency?: number;
 }): Promise<ReconcileBalancesResult> {
-  const allEvents = opts.events ?? (await loadEventsFromSilver());
-  const windowEvents = allEvents.filter((e) => e.blockNumber >= opts.fromBlock && e.blockNumber <= opts.toBlock);
-
+  const netDeltas = opts.events
+    ? netDeltasFromEvents(opts.events, opts.fromBlock, opts.toBlock)
+    : await loadWindowNetDeltasFromSilver(opts.fromBlock, opts.toBlock);
+  const touchedColdkeys = [...netDeltas.keys()];
   const knownGoodBalances = opts.knownGoodBalances ?? new Map<Coldkey, Rao>();
-
-  const touchedColdkeys = new Set<Coldkey>();
-  for (const event of windowEvents) {
-    if (event.kind === "transfer") {
-      touchedColdkeys.add(event.from);
-      touchedColdkeys.add(event.to);
-    } else {
-      touchedColdkeys.add(event.coldkey);
-    }
-  }
 
   const client = opts.client;
   const concurrency = opts.concurrency ?? 1;
@@ -226,35 +194,32 @@ export async function reconcileBalances(opts: {
   const endBlockHash = await client.call<string>("chain_getBlockHash", [opts.toBlock]);
   const registry = await loadRegistryForBlock(client, endBlockHash);
 
-  // Only coldkeys touched here for the first time (not already carried
-  // forward from a prior, validated checkpoint) need a real on-chain read.
-  const newlyTouched = [...touchedColdkeys].filter((coldkey) => !knownGoodBalances.has(coldkey));
-  const freshBaselineEntries = await mapWithConcurrency(newlyTouched, concurrency, async (coldkey) => {
-    const key = systemAccountKey(coldkey);
-    const hex = await client.call<string | null>("state_getStorage", [key, startBlockHash]);
-    return [coldkey, asRao(decodeFreeBalance(registry, hex))] as const;
-  });
+  const newlyTouched = touchedColdkeys.filter((coldkey) => !knownGoodBalances.has(coldkey));
+  const freshBaselines = new Map<Coldkey, bigint>(
+    await mapWithConcurrency(newlyTouched, concurrency, async (coldkey) => {
+      const hex = await client.call<string | null>("state_getStorage", [systemAccountKey(coldkey), startBlockHash]);
+      return [coldkey, totalBalance(registry, hex).total] as const;
+    }),
+  );
 
-  const initial = new Map<Coldkey, Rao>(knownGoodBalances);
-  for (const [coldkey, rao] of freshBaselineEntries) {
-    initial.set(coldkey, rao);
-  }
-
-  const reconstructed = reconstructBalances(windowEvents, initial);
-
-  const rows = await mapWithConcurrency([...touchedColdkeys], concurrency, async (coldkey): Promise<ReconciliationRow> => {
-    const key = systemAccountKey(coldkey);
-    const accountInfoHex = await client.call<string | null>("state_getStorage", [key, endBlockHash]);
-    const actualRao = decodeFreeBalance(registry, accountInfoHex);
-    const reconstructedRao = reconstructed.get(coldkey) ?? 0n;
+  const rows = await mapWithConcurrency(touchedColdkeys, concurrency, async (coldkey): Promise<ReconciliationRow> => {
+    const accountInfoHex = await client.call<string | null>("state_getStorage", [systemAccountKey(coldkey), endBlockHash]);
+    const actual = totalBalance(registry, accountInfoHex);
+    const baselineRao = knownGoodBalances.get(coldkey) ?? freshBaselines.get(coldkey) ?? 0n;
+    const reconstructedRao = baselineRao + netDeltas.get(coldkey)!;
     return {
       coldkey,
-      baselineRao: initial.get(coldkey) ?? 0n,
+      baselineRao,
       reconstructedRao,
-      actualRao,
-      matches: reconstructedRao === actualRao,
+      actualRao: actual.total,
+      actualFreeRao: actual.free,
+      actualReservedRao: actual.reserved,
+      matches: reconstructedRao === actual.total,
     };
   });
+
+  const balances = new Map<Coldkey, Rao>(knownGoodBalances);
+  for (const row of rows) balances.set(row.coldkey, asRao(row.actualRao));
 
   return {
     fromBlock: opts.fromBlock,
@@ -263,6 +228,6 @@ export async function reconcileBalances(opts: {
     endBlockHash,
     touchedAccounts: rows.length,
     rows,
-    balances: reconstructed,
+    balances,
   };
 }

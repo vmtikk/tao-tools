@@ -6,6 +6,7 @@ import { asBlockNumber, asColdkey, asRao } from "@tao-tools/core";
 import type { BlockmachineClient } from "@tao-tools/ingest";
 import { systemAccountKey } from "@tao-tools/ingest";
 import { buildRegistry } from "../src/chain/decodeEvents.js";
+import { accountInfoType } from "../src/chain/decodeAccount.js";
 import { reconcileBalances } from "../src/chain/reconcileBalances.js";
 
 const metadataFixture = JSON.parse(
@@ -13,8 +14,8 @@ const metadataFixture = JSON.parse(
 ) as { metadataHex: string };
 const registry = buildRegistry(metadataFixture.metadataHex);
 
-function encodeAccountInfo(freeRao: bigint): string {
-  return registry.createType("AccountInfo", { data: { free: freeRao } }).toHex();
+function encodeAccountInfo(freeRao: bigint, reservedRao = 0n): string {
+  return registry.createType(accountInfoType(registry), { data: { free: freeRao, reserved: reservedRao } }).toHex();
 }
 
 const ALICE = asColdkey("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY");
@@ -155,6 +156,32 @@ describe("reconcileBalances", () => {
     expect(result.balances.get(ALICE)).toBe(500n); // carried through unchanged
     expect(result.balances.get(BOB)).toBe(9n);
     expect(result.balances.get(CHARLIE)).toBe(1n);
+  });
+
+  it("reconciles against free + reserved, since the fold never sees free<->reserved moves", async () => {
+    // Bob receives 100, then reserves 40 of it (e.g. an identity deposit) —
+    // a Balances.Reserved event the fold doesn't track. On-chain: free 60, reserved 40.
+    const events: BalanceEvent[] = [transfer(150, 0, ALICE, BOB, 100n)];
+    const base = fakeClientForColdkeys({ 99: { [ALICE]: 100n } });
+    const bobKey = systemAccountKey(BOB);
+    const aliceKey = systemAccountKey(ALICE);
+    const client: BlockmachineClient = {
+      ...base,
+      async call<T>(method: string, params: unknown[]): Promise<T> {
+        const [key, hash] = params as [string, string];
+        if (method === "state_getStorage" && hash === "0xhash200") {
+          if (key === bobKey) return encodeAccountInfo(60n, 40n) as T;
+          if (key === aliceKey) return encodeAccountInfo(0n) as T;
+        }
+        return base.call(method, params);
+      },
+    };
+
+    const result = await reconcileBalances({ fromBlock: 100, toBlock: 200, client, events });
+
+    const bob = result.rows.find((r) => r.coldkey === BOB)!;
+    expect(bob).toMatchObject({ reconstructedRao: 100n, actualRao: 100n, actualFreeRao: 60n, actualReservedRao: 40n, matches: true });
+    expect(result.balances.get(BOB)).toBe(100n);
   });
 
   it("only reports rows for coldkeys touched in this window, not every coldkey ever known", async () => {

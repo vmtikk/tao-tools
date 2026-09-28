@@ -6,6 +6,7 @@ import { asBlockNumber, asColdkey, asRao } from "@tao-tools/core";
 import type { BlockmachineClient } from "@tao-tools/ingest";
 import { systemAccountKey } from "@tao-tools/ingest";
 import { buildRegistry } from "../src/chain/decodeEvents.js";
+import { accountInfoType } from "../src/chain/decodeAccount.js";
 import { runReconciliationCheckpoints } from "../src/chain/runReconciliationCheckpoints.js";
 
 const metadataFixture = JSON.parse(
@@ -13,8 +14,8 @@ const metadataFixture = JSON.parse(
 ) as { metadataHex: string };
 const registry = buildRegistry(metadataFixture.metadataHex);
 
-function encodeAccountInfo(freeRao: bigint): string {
-  return registry.createType("AccountInfo", { data: { free: freeRao } }).toHex();
+function encodeAccountInfo(freeRao: bigint, reservedRao = 0n): string {
+  return registry.createType(accountInfoType(registry), { data: { free: freeRao, reserved: reservedRao } }).toHex();
 }
 
 const ALICE = asColdkey("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY");
@@ -134,6 +135,23 @@ describe("runReconciliationCheckpoints", () => {
 
     expect(checkpoints).toHaveLength(1);
     expect(checkpoints[0]!.mismatches.length).toBeGreaterThan(0);
+  });
+
+  it("carries the on-chain balance forward after a mismatch, so the gap doesn't cascade into later windows", async () => {
+    // Window 1: the fold misses 5 rao Bob really received (chain says 105, fold says 100).
+    // Window 2: Bob sends 30 to Charlie, which the fold does see.
+    const events: BalanceEvent[] = [transfer(50, ALICE, BOB, 100n), transfer(150, BOB, CHARLIE, 30n)];
+    const client = fakeClientForColdkeys({
+      0: { [ALICE]: 100n },
+      100: { [ALICE]: 0n, [BOB]: 105n },
+      200: { [BOB]: 75n, [CHARLIE]: 30n },
+    });
+
+    const checkpoints = await runReconciliationCheckpoints({ client, intervalBlocks: 100, upToBlock: 200, fromBlock: 1, events });
+
+    expect(checkpoints[0]!.mismatches.map((m) => m.coldkey)).toEqual([BOB]);
+    // Seeded from the real 105, window 2 reconciles cleanly (105 - 30 = 75).
+    expect(checkpoints[1]!.mismatches).toEqual([]);
   });
 
   it("resumeFrom skips already-completed windows and reuses their carried-forward balances", async () => {

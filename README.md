@@ -646,12 +646,38 @@ things fell out of actually running it for the first time:
    `DustLost`-inclusive silver. This is exactly what reconciliation is for; the sample run did its
    job on the first real attempt.
 
-**Not yet done: the full genesis-to-head run.** It needs `data/silver/balance_events.parquet`
-rebuilt first (the real one still predates the `DustLost` fix — see above), which is the long pole
-now, not RPC budget or throughput. Once that's rebuilt, rerun `chain:reconcile-checkpoints` with
-`UP_TO_BLOCK=8929643` and a real `CHAIN_CONCURRENCY` — untested at that scale, so treat the
-backfill's ~110-120 calls/s ceiling as a planning number, not a confirmed one, and watch the first
-hour or so of a real full run before assuming it'll hold.
+**Full genesis-to-head run done 2026-09-28: the fold reconciles.** 42 windows of 216,000 blocks
+(genesis to 9,072,000), `CHAIN_CONCURRENCY=50`, 1,755,531 RPC calls in ~2.5h (~190 calls/s, well
+above the backfill's ~110-120). Every window through block 4,968,000 reconciled exactly; after that,
+**319 mismatches across 248 coldkeys out of ~1.23M coldkey checks (~0.03%)**, all dust-sized:
+largest 0.0095 TAO, median a few thousand rao, net 0.005 TAO summed. None are pallet accounts.
+About 78% have the fold too high (a missing small debit) and the same amounts recur (4,680 rao x17,
+660 x14, 4,575 x13), which points at a fixed fee or burn emitted as a balances event type not yet
+decoded in newer runtimes. Not yet identified. The full per-window output, with every mismatch's
+free/reserved split, is in `reconcile-full.log` (local, gitignored).
+
+Getting there needed three fixes to the reconciler itself, none of which the 20K-block samples could
+surface:
+- **It loaded every event in silver into one JS array up front** (~370M objects at full scale) and
+  folded them with a reducer that copies the whole balance map per event. Each window now gets its
+  per-coldkey net change from DuckDB (`loadWindowNetDeltasFromSilver`); only end-of-window balances
+  are compared, so the net sum is exactly what the fold would end on.
+- **It carried reconstructed balances forward**, so one gap cascaded into every later window. It
+  now carries the actual on-chain balance just read, so each window independently tests the fold and
+  a mismatch points at the window it came from.
+- **It decoded `System.Account` with polkadot.js's built-in `AccountInfo`**, which assumes 128-bit
+  balances; Bittensor's are 64-bit, so any account holding a reserve read as free + reserved x 2^64
+  (found at window 9: ~1.8e28 rao). `decodeAccountBalances` now uses the runtime metadata's own
+  storage type. Reconciliation compares against **free + reserved**: the fold never sees free <->
+  reserved moves (identity deposits, registrations...), so the total is what it actually tracks.
+
+What this does and doesn't settle for Phase 3: reconciliation seeds each coldkey from a real on-chain
+read the first time it's touched, so it proves the *event set* is complete (to dust). It does not
+fix `account_balances_daily`, which folds from zero with no such baseline and still shows ~117K
+negative-balance rows across ~10.6K coldkeys. Given every window reconciles, those negatives should
+come from balances that existed before a coldkey's first event, most likely accounts endowed directly
+in genesis state (Finney launched with balances carried over from the previous network). Seeding
+the fold from a genesis `System.Account` snapshot is the likely fix; not built yet.
 
 ### Sharded gold metrics (`shard_by`)
 

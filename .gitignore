@@ -14,6 +14,8 @@ data/meta/chain_backfill_checkpoint.json
 data/meta/chain_materialize_silver_checkpoint.json
 data/meta/materialize_silver_skipped_blocks.jsonl
 data/meta/price_backfill_checkpoint.json
+data/meta/reconciliation_checkpoint.json
+data/meta/gold_shard_checkpoint_*.json
 
 .env
 .env.local

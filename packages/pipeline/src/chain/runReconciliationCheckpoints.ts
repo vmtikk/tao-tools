@@ -1,6 +1,6 @@
 import type { BalanceEvent, BalanceMap, Coldkey, Rao } from "@tao-tools/core";
 import type { BlockmachineClient } from "@tao-tools/ingest";
-import { loadEventsFromSilver, reconcileBalances, type ReconciliationRow } from "./reconcileBalances.js";
+import { reconcileBalances, type ReconciliationRow } from "./reconcileBalances.js";
 
 export interface CheckpointResult {
   fromBlock: number;
@@ -26,9 +26,9 @@ export interface RunReconciliationCheckpointsOptions {
   upToBlock: number;
   /** Defaults to 1 (genesis) — the plan's monthly checkpoints start there. */
   fromBlock?: number;
-  /** Pre-loaded events, bypassing the default `loadEventsFromSilver()` read
-   * — lets tests exercise the windowing/carry-forward logic without real
-   * silver Parquet files on disk. */
+  /** In-memory events instead of reading each window from silver — lets
+   * tests exercise the windowing/carry-forward logic without real silver
+   * Parquet files on disk. */
   events?: readonly BalanceEvent[];
   /** Forwarded to each `reconcileBalances` call — see its own doc comment.
    * Default 1 (sequential, the original behavior). */
@@ -61,10 +61,10 @@ export interface RunReconciliationCheckpointsOptions {
  * against last month's already-agreed closing balance, not your entire
  * transaction history back to account opening.
  *
- * Loads silver once, up front, rather than once per checkpoint (each
- * `reconcileBalances` call only needs the events *within* its own window,
- * but re-reading the same Parquet files from disk dozens of times over would
- * be wasted work as the checkpoint count grows).
+ * Each window reads only its own slice of silver (a per-coldkey net change,
+ * see `loadWindowNetDeltasFromSilver`). An earlier version loaded every
+ * event in silver up front, which the full ~370M-event index can't fit in
+ * memory.
  */
 export async function runReconciliationCheckpoints(
   opts: RunReconciliationCheckpointsOptions,
@@ -73,7 +73,6 @@ export async function runReconciliationCheckpoints(
     throw new Error(`intervalBlocks must be positive, got ${opts.intervalBlocks}`);
   }
 
-  const events = opts.events ?? (await loadEventsFromSilver(opts.upToBlock));
   const results: CheckpointResult[] = [];
 
   let knownGoodBalances: BalanceMap = opts.resumeFrom?.knownGoodBalances ?? new Map<Coldkey, Rao>();
@@ -87,7 +86,7 @@ export async function runReconciliationCheckpoints(
       toBlock: windowEnd,
       client: opts.client,
       knownGoodBalances,
-      events,
+      events: opts.events,
       concurrency: opts.concurrency,
     });
 

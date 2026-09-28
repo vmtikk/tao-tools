@@ -640,7 +640,11 @@ checkpoints" clause is still outstanding.)
    silently duplicated one batch into silver (1,447 duplicate transfer rows in blocks
    5,425,008–5,427,996, since repaired), and a hard power-off can leave the JSON checkpoint
    NUL-filled while the staging DB stays intact, which is recoverable.
-3. ⚠️ **Sized 2026-09-09, not yet run — now the only remaining step.** Run `chain:reconcile-checkpoints`
+3. ✅ **Run for real 2026-09-28: the fold reconciles** — 42 windows, genesis to 9,072,000, 319
+   dust-sized mismatches out of ~1.23M coldkey checks (largest 0.0095 TAO, net 0.005 TAO), all after
+   block 4.97M. See the README's "Full genesis-to-head run done" for the three reconciler fixes it
+   took and what it does and doesn't settle for `account_balances_daily`. Earlier status, kept for
+   history: **Sized 2026-09-09, not yet run — now the only remaining step.** Run `chain:reconcile-checkpoints`
    with `UP_TO_BLOCK=8929643` (silver now covers the full range, so the old "once it's caught back up"
    caveat is gone). Three real-data attempts on 2026-09-05 all failed before reaching a verdict (see
    Phase 3.1's entries below); this has still never completed against real (non-fixture) chain data.

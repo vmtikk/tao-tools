@@ -68,6 +68,7 @@ async function main(): Promise<void> {
     `Running reconciliation checkpoints: blocks ${fromBlock}-${upToBlock}, ${intervalBlocks} blocks/checkpoint, concurrency ${concurrency}.`,
   );
 
+  const startedAt = Date.now();
   const checkpoints = await runReconciliationCheckpoints({
     client,
     intervalBlocks,
@@ -75,7 +76,21 @@ async function main(): Promise<void> {
     fromBlock,
     concurrency,
     resumeFrom,
+    // Printed per window, not at the end: a multi-hour run should show
+    // progress, and an interrupted one should still leave its results in the log.
     onWindowComplete: (result, knownGoodBalances) => {
+      const status = result.mismatches.length === 0 ? "OK" : "MISMATCH";
+      const elapsedMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
+      console.log(
+        `  [${status}] blocks ${result.fromBlock}-${result.toBlock}: ${result.touchedAccounts} touched, ` +
+          `${result.mismatches.length} mismatched (${client.requestCount} RPC calls, ${elapsedMin} min elapsed)`,
+      );
+      for (const row of result.mismatches) {
+        console.log(
+          `      ${row.coldkey}: baseline=${row.baselineRao} reconstructed=${row.reconstructedRao} ` +
+            `actual=${row.actualRao} (free ${row.actualFreeRao} + reserved ${row.actualReservedRao})`,
+        );
+      }
       priorMismatches += result.mismatches.length;
       writeReconciliationCheckpoint({
         fromBlock,
@@ -97,15 +112,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  let newMismatches = 0;
-  for (const cp of checkpoints) {
-    const status = cp.mismatches.length === 0 ? "OK" : "MISMATCH";
-    console.log(`  [${status}] blocks ${cp.fromBlock}-${cp.toBlock}: ${cp.touchedAccounts} touched, ${cp.mismatches.length} mismatched`);
-    for (const row of cp.mismatches) {
-      console.log(`      ${row.coldkey}: reconstructed=${row.reconstructedRao} actual=${row.actualRao}`);
-    }
-    newMismatches += cp.mismatches.length;
-  }
+  const newMismatches = checkpoints.reduce((sum, cp) => sum + cp.mismatches.length, 0);
 
   if (priorMismatches === 0) {
     console.log(`All checkpoints reconciled exactly (${checkpoints.length} new this run).`);
